@@ -1,0 +1,13 @@
+go-dmg-writer
+Copyright 2026 go-dmg-writer authors
+
+This product includes software developed as part of the go-dmg-writer project.
+
+This is a clean-room implementation of the Apple HFSX filesystem and the
+Apple UDIF (Universal Disk Image Format) container, written from public
+specifications:
+
+  - Apple Technical Note TN1150 ("HFS Plus Volume Format"),
+    https://developer.apple.com/library/archive/technotes/tn/tn1150.html
+  - Publicly documented UDIF / KOLY layout (Apple's `hdiutil` man page
+    semantics and community reverse-engineering).
