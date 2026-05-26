@@ -95,10 +95,22 @@ func BuildPlan(
 	}
 
 	// Compute per-file block counts and total user data blocks.
+	//
+	// The single-extent invariant: every file is laid out as ONE
+	// contiguous run of blocks (the extents-overflow tree is left
+	// empty by [BuildExtentsTree]). A single ExtentDescriptor uses
+	// 32-bit BlockCount, so the practical per-file ceiling is
+	// 0xFFFFFFFF blocks (~16 TiB at 4 KiB blocks). Reject anything
+	// over that explicitly so the contract is visible.
 	placements := make([]FilePlacement, len(files))
 	var userBlocks uint32
 	for i, f := range files {
-		blks := uint32(DivRoundUp(f.Size, uint64(blockSize)))
+		blks64 := DivRoundUp(f.Size, uint64(blockSize))
+		if blks64 > uint64(^uint32(0)) {
+			return nil, fmt.Errorf("hfsplus: file size %d (%d blocks) exceeds single-extent maximum %d blocks",
+				f.Size, blks64, ^uint32(0))
+		}
+		blks := uint32(blks64)
 		placements[i].Blocks = blks
 		userBlocks += blks
 	}
@@ -157,20 +169,19 @@ func BuildPlan(
 	// region beyond `cursor` (none in our packed layout — we touch every
 	// block from 0 up to and including the trailing alt-VH block).
 	bm := NewAllocationBitmap(totalBlocks)
-	bm.MarkUsed(0, 1)                          // boot + primary VH
-	bm.MarkUsed(allocStart, allocBlocks)       // allocation bitmap itself
-	bm.MarkUsed(catStart, catalogBlocks)       // catalog
-	bm.MarkUsed(extStart, extentsBlocks)       // extents overflow
-	bm.MarkUsed(attrStart, attrsBlocks)        // attributes
+	bm.MarkUsed(0, 1)                    // boot + primary VH
+	bm.MarkUsed(allocStart, allocBlocks) // allocation bitmap itself
+	bm.MarkUsed(catStart, catalogBlocks) // catalog
+	bm.MarkUsed(extStart, extentsBlocks) // extents overflow
+	bm.MarkUsed(attrStart, attrsBlocks)  // attributes
 	for _, p := range placements {
 		bm.MarkUsed(p.StartBlock, p.Blocks)
 	}
 	bm.MarkUsed(totalBlocks-1, 1) // alternate VH
 
-	// fileCount/folderCount/encodingsBitmap come straight from the
-	// entries; the root folder is NOT counted in folderCount per TN1150.
+	// fileCount/folderCount come straight from the entries; the root
+	// folder is NOT counted in folderCount per TN1150.
 	var fileCount, folderCount uint32
-	var encodings uint64
 	var maxCNID uint32
 	for _, e := range entries {
 		if e.CNID == CNIDRootParent {
@@ -187,12 +198,24 @@ func BuildPlan(
 		case KindFile, KindSymlink:
 			fileCount++
 		}
-		encodings |= 1 << e.EncodingBit()
 	}
+
+	// EncodingsBitmap is a hint that tells legacy mounters which
+	// text-encoding tables the catalog references. Apple's hdiutil
+	// always sets bit 0 (MacRoman) regardless of which scripts the
+	// names actually use, because on HFSX the per-record TextEncoding
+	// field is authoritative. We do the same: bit 0 is always set,
+	// other bits are always clear.
+	//
+	// (An earlier revision OR'd `1 << e.TextEncodingHint()` per entry,
+	// but TextEncodingHint returns the encoding NUMBER (0 or 0x7F),
+	// not a bit position; `1 << 0x7F` on a uint64 is 0 anyway, so the
+	// expression was a no-op for non-ASCII names.)
+	const encodings uint64 = 1
 
 	// NextAllocation points at the first free block (first block past
 	// the user-data region). For a packed layout with padding this is
-	// `cursor`; if cursor happens to land on the alt-VH block it wraps
+	// `cursor`; if the cursor happens to land on the alt-VH block it wraps
 	// to zero per TN1150 ("undefined" but conventionally 0).
 	nextAlloc := cursor
 	if nextAlloc >= totalBlocks-1 {

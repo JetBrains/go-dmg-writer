@@ -31,32 +31,32 @@ func TestCatalogThreadKey(t *testing.T) {
 
 func TestBuildCatalogTreeSmall(t *testing.T) {
 	root := &Entry{
-		CNID:             CNIDRootFolder,
-		ParentCNID:       CNIDRootParent,
-		Name:             HFSName{},
-		Kind:             KindFolder,
-		Mode:             0o040755,
-		Valence:          2,
-		CreateTime:       1, ContentModTime: 1, AttributeModTime: 1, AccessTime: 1, BackupTime: 1,
+		CNID:       CNIDRootFolder,
+		ParentCNID: CNIDRootParent,
+		Name:       HFSName{},
+		Kind:       KindFolder,
+		Mode:       0o040755,
+		Valence:    2,
+		CreateTime: 1, ContentModTime: 1, AttributeModTime: 1, AccessTime: 1, BackupTime: 1,
 	}
 	f1 := &Entry{
-		CNID:             CNIDFirstUser,
-		ParentCNID:       CNIDRootFolder,
-		Name:             mustName(t, "alpha.txt"),
-		Kind:             KindFile,
-		Mode:             0o100644,
-		DataLogicalSize:  123,
-		DataTotalBlocks:  1,
-		CreateTime:       1, ContentModTime: 1, AttributeModTime: 1, AccessTime: 1, BackupTime: 1,
+		CNID:            CNIDFirstUser,
+		ParentCNID:      CNIDRootFolder,
+		Name:            mustName(t, "alpha.txt"),
+		Kind:            KindFile,
+		Mode:            0o100644,
+		DataLogicalSize: 123,
+		DataTotalBlocks: 1,
+		CreateTime:      1, ContentModTime: 1, AttributeModTime: 1, AccessTime: 1, BackupTime: 1,
 	}
 	d1 := &Entry{
-		CNID:             CNIDFirstUser + 1,
-		ParentCNID:       CNIDRootFolder,
-		Name:             mustName(t, "subdir"),
-		Kind:             KindFolder,
-		Mode:             0o040755,
-		Valence:          0,
-		CreateTime:       1, ContentModTime: 1, AttributeModTime: 1, AccessTime: 1, BackupTime: 1,
+		CNID:       CNIDFirstUser + 1,
+		ParentCNID: CNIDRootFolder,
+		Name:       mustName(t, "subdir"),
+		Kind:       KindFolder,
+		Mode:       0o040755,
+		Valence:    0,
+		CreateTime: 1, ContentModTime: 1, AttributeModTime: 1, AccessTime: 1, BackupTime: 1,
 	}
 	r, err := BuildCatalogTree([]*Entry{root, f1, d1}, 4096)
 	if err != nil {

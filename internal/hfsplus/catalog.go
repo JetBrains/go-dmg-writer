@@ -62,11 +62,14 @@ type Entry struct {
 	SymlinkTarget string
 }
 
-// EncodingBit returns 0 (MacRoman) for ASCII-only names, 0x7F (Unicode)
-// otherwise. Caller writes this to CatalogFile.TextEncoding /
-// CatalogFolder.TextEncoding and OR's the bit into the volume header's
-// encodingsBitmap.
-func (e *Entry) EncodingBit() uint32 {
+// TextEncodingHint returns the textEncoding NUMBER (not a bit position!)
+// stored in CatalogFile.TextEncoding / CatalogFolder.TextEncoding: 0
+// (MacRoman) for ASCII-only names, 0x7F (Unicode) otherwise.
+//
+// Do NOT shift this value into a bitmap: the volume header's
+// encodingsBitmap uses bit positions, and `1 << 0x7F` on a uint64 is 0.
+// The header is built independently in [BuildPlan].
+func (e *Entry) TextEncodingHint() uint32 {
 	if e.Name.IsASCII() {
 		return 0
 	}
@@ -155,11 +158,11 @@ func compareCatalogKeys(a, b []byte) int {
 	}
 	la := int(binary.BigEndian.Uint16(a[4:6]))
 	lb := int(binary.BigEndian.Uint16(b[4:6]))
-	min := la
-	if lb < min {
-		min = lb
+	minimum := la
+	if lb < minimum {
+		minimum = lb
 	}
-	for i := 0; i < min; i++ {
+	for i := 0; i < minimum; i++ {
 		ua := binary.BigEndian.Uint16(a[6+i*2 : 6+i*2+2])
 		ub := binary.BigEndian.Uint16(b[6+i*2 : 6+i*2+2])
 		if ua < ub {
@@ -182,7 +185,7 @@ func compareCatalogKeys(a, b []byte) int {
 func encodeCatalogFolderRecord(e *Entry) []byte {
 	// fsck_hfs *requires* every folder to carry kHFSHasFolderCountMask
 	// on HFSX volumes (and tolerates it on HFS+ too), with FolderCount
-	// holding the count of immediate sub-folders.
+	// holding the count of immediate subfolders.
 	flags := uint16(CatFlagHasFolderCount)
 	if e.HasAttributes {
 		flags |= CatFlagHasAttributes
@@ -202,7 +205,7 @@ func encodeCatalogFolderRecord(e *Entry) []byte {
 			GroupID:  e.GroupID,
 			FileMode: e.Mode,
 		},
-		TextEncoding: e.EncodingBit(),
+		TextEncoding: e.TextEncodingHint(),
 		FolderCount:  e.SubFolderCount,
 	}
 	buf := make([]byte, CatalogFolderSize)
@@ -229,7 +232,7 @@ func encodeCatalogFileRecord(e *Entry) []byte {
 			GroupID:  e.GroupID,
 			FileMode: e.Mode,
 		},
-		TextEncoding: e.EncodingBit(),
+		TextEncoding: e.TextEncodingHint(),
 		DataFork: ForkData{
 			LogicalSize: e.DataLogicalSize,
 			TotalBlocks: e.DataTotalBlocks,
