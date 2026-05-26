@@ -1,0 +1,164 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel any prior run of this workflow on the same ref. Keeps the PR
+# tab tidy when a contributor force-pushes during review.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+# Pipeline shape:
+#
+#   lint
+#    ├─ build-linux  ──▶ test-linux
+#    ├─ build-macos  ──▶ test-macos
+#    └─ build-windows ──▶ test-windows
+#
+# `lint` is the gate: a gofmt or vet failure cancels everything else
+# before any platform spins up a runner. Each platform then has its own
+# build job which gates that platform's test job, so a Linux build
+# failure does not stop the macOS or Windows pipelines.
+#
+# We pin a single Go version (matched to go.mod's `go` directive). If the
+# project ever needs to support an older floor, reintroduce a strategy
+# matrix on `go-version` and bump go.mod accordingly.
+
+env:
+  GO_VERSION: '1.23'
+
+jobs:
+  # ───────────────────────── Lint gate ─────────────────────────
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: gofmt
+        # gofmt -l prints offending files and is silent on success. We
+        # turn that into a hard failure so unformatted code can't slip
+        # past review.
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::The following files are not gofmt-clean:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go vet (large build tag)
+        # The performance benchmark file is gated behind `//go:build large`
+        # and isn't compiled on a vanilla `go vet ./...`. Vetting it in
+        # the lint job catches obvious regressions in the bench harness
+        # without needing a full build matrix.
+        run: go vet -tags=large ./...
+
+  # ───────────────────────── Linux ─────────────────────────────
+  build-linux:
+    name: build (ubuntu)
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - name: go build
+        run: go build ./...
+
+  test-linux:
+    name: test (ubuntu)
+    needs: build-linux
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      # The race detector adds ~2x runtime; that's still well under the
+      # GitHub Actions free-tier minutes ceiling for this size of test
+      # suite. Worth it for catching shared-state bugs in the
+      # parallel-compression worker pool.
+      - name: go test -race
+        run: go test -race -count=1 ./...
+
+  # ───────────────────────── macOS ─────────────────────────────
+  build-macos:
+    name: build (macos)
+    needs: lint
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - name: go build
+        run: go build ./...
+
+  test-macos:
+    name: test (macos)
+    needs: build-macos
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: go test -race
+        run: go test -race -count=1 ./...
+
+      # The darwin-gated tests in dmg_darwin_test.go shell out to
+      # hdiutil / fsck_hfs. They're already build-tagged for darwin, so
+      # they only compile on macOS; running them explicitly here makes
+      # failures impossible to miss in the test output.
+      - name: hdiutil / fsck_hfs end-to-end
+        run: go test -count=1 -run 'TestHdiutilVerify|TestFsckHFS|TestMountAndCompare' .
+
+  # ───────────────────────── Windows ───────────────────────────
+  build-windows:
+    name: build (windows)
+    needs: lint
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - name: go build
+        run: go build ./...
+
+  test-windows:
+    name: test (windows)
+    needs: build-windows
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: go test -race
+        run: go test -race -count=1 ./...
