@@ -47,8 +47,39 @@ func TestNewNameTooLong(t *testing.T) {
 	}
 }
 
+// TestNewNameAppleNFDException is a known-failing test that documents
+// the gap between standard Unicode NFD (what we apply today via
+// `golang.org/x/text/unicode/norm`) and Apple's HFS+ NFD exception
+// table (TN1150 §"HFS+ Decomposition").
+//
+// The U+2000-U+2FFF range (general punctuation) and U+F900-U+FAFF
+// (CJK compatibility ideographs) are NOT decomposed under Apple's
+// rules, but standard NFD does decompose at least some of them. For
+// example, U+2002 (EN SPACE) is decomposed to U+0020 (SPACE) by
+// standard NFD, while Apple's NFD leaves it as U+2002.
+//
+// This test is currently t.Skip()'d so the test suite stays green
+// while the gap is tracked. Removing the skip is the indicator that
+// the exception table has been implemented.
+func TestNewNameAppleNFDException(t *testing.T) {
+	t.Skip("Apple-NFD exception table not yet implemented (see TN1150)")
+	n, err := NewName("\u2002") // U+2002 EN SPACE
+	if err != nil {
+		t.Fatalf("NewName: %v", err)
+	}
+	if n.LenU16() != 1 {
+		t.Errorf("len: got %d want 1 (Apple-NFD does not decompose U+2002)", n.LenU16())
+	}
+	if len(n.Units) != 1 || n.Units[0] != 0x2002 {
+		t.Errorf("units: got %v want [0x2002]", n.Units)
+	}
+}
+
 func TestHFSCompare(t *testing.T) {
-	cases := []struct{ a, b string; want int }{
+	cases := []struct {
+		a, b string
+		want int
+	}{
 		{"a", "b", -1},
 		{"b", "a", 1},
 		{"a", "a", 0},

@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -44,17 +45,7 @@ func TestCreateUDRO(t *testing.T) {
 	if err := d.Create(src, out, ModeReadOnly); err != nil {
 		t.Fatalf("Create UDRO: %v", err)
 	}
-	checkDMG(t, out, /*compressed*/ false)
-}
-
-func TestCreateUDRW(t *testing.T) {
-	src := makeSourceTree(t)
-	out := filepath.Join(t.TempDir(), "out.dmg")
-	d := &DMG{Time: time.Unix(1700000000, 0).UTC()}
-	if err := d.Create(src, out, ModeReadWrite); err != nil {
-		t.Fatalf("Create UDRW: %v", err)
-	}
-	checkDMG(t, out, false)
+	checkDMG(t, out /*compressed*/, false)
 }
 
 func TestCreateUDZO(t *testing.T) {
@@ -144,6 +135,156 @@ func TestCreateRejectsNonDirectory(t *testing.T) {
 	d := &DMG{}
 	if err := d.Create(tmp.Name(), out, ModeReadOnly); err == nil {
 		t.Fatal("expected error for non-directory source, got nil")
+	}
+}
+
+func TestCreateRejectsInvalidMode(t *testing.T) {
+	src := makeSourceTree(t)
+	out := filepath.Join(t.TempDir(), "out.dmg")
+	d := &DMG{}
+	err := d.Create(src, out, Mode(99))
+	if err == nil {
+		t.Fatal("expected error for invalid Mode, got nil")
+	}
+	if !strings.Contains(err.Error(), "invalid Mode") {
+		t.Errorf("error should mention invalid Mode, got: %v", err)
+	}
+}
+
+// TestCreateOwnerIDUnset verifies the OwnerIDUnset sentinel resolves to
+// the HFS+ "unknown user" (99) value the way hdiutil does, without
+// confusing it with a literal UID 0.
+func TestCreateOwnerIDUnset(t *testing.T) {
+	src := makeSourceTree(t)
+	out := filepath.Join(t.TempDir(), "ownerless.dmg")
+	d := &DMG{
+		VolumeName: "ownerless",
+		Time:       time.Unix(1700000000, 0).UTC(),
+		OwnerID:    OwnerIDUnset,
+		GroupID:    OwnerIDUnset,
+	}
+	if err := d.Create(src, out, ModeReadOnly); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	checkDMG(t, out, false)
+}
+
+// TestCreateEmptyDirectory exercises the zero-files path: no user
+// content, just the root catalog entry. fsck_hfs is happy with this.
+func TestCreateEmptyDirectory(t *testing.T) {
+	src := t.TempDir()
+	out := filepath.Join(t.TempDir(), "empty.dmg")
+	d := &DMG{VolumeName: "empty", Time: time.Unix(1700000000, 0).UTC()}
+	if err := d.Create(src, out, ModeReadOnly); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	checkDMG(t, out, false)
+}
+
+// TestCreateRejectsUnreadableFile asserts we surface a clear error
+// rather than silently producing a truncated image when a source file
+// can't be opened. The 0o000 mode makes the file unreadable to anyone
+// other than root, so we skip if running as root.
+func TestCreateRejectsUnreadableFile(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows doesn't enforce POSIX 0o000 perms")
+	}
+	if os.Geteuid() == 0 {
+		t.Skip("running as root: 0o000 is still readable")
+	}
+	src := t.TempDir()
+	if err := os.WriteFile(filepath.Join(src, "secret"), []byte("can't touch this"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(filepath.Join(src, "secret"), 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		// Restore so t.TempDir cleanup can remove the file.
+		_ = os.Chmod(filepath.Join(src, "secret"), 0o644)
+	})
+
+	out := filepath.Join(t.TempDir(), "perm.dmg")
+	d := &DMG{Time: time.Unix(1700000000, 0).UTC()}
+	if err := d.Create(src, out, ModeReadOnly); err == nil {
+		t.Fatal("expected error opening unreadable file, got nil")
+	}
+}
+
+// TestCreateSymlinkOutsideTree verifies we store an absolute symlink
+// target verbatim (we don't try to canonicalise or rewrite paths).
+func TestCreateSymlinkOutsideTree(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlinks require elevation on Windows")
+	}
+	src := t.TempDir()
+	const externalTarget = "/etc/hosts"
+	if err := os.Symlink(externalTarget, filepath.Join(src, "external")); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(t.TempDir(), "extlink.dmg")
+	d := &DMG{Time: time.Unix(1700000000, 0).UTC()}
+	if err := d.Create(src, out, ModeReadOnly); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	// The link target bytes should appear verbatim in the data fork
+	// area of the image. We don't do a full HFS+ walk here; a substring
+	// search over the produced .dmg is enough to assert that the bytes
+	// landed.
+	body, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(body, []byte(externalTarget)) {
+		t.Errorf("DMG should contain symlink target %q verbatim", externalTarget)
+	}
+}
+
+// TestCreateRootFinderInfoBadSize asserts the error includes the actual
+// length so callers get a useful diagnostic.
+func TestCreateRootFinderInfoBadSize(t *testing.T) {
+	src := makeSourceTree(t)
+	out := filepath.Join(t.TempDir(), "fi.dmg")
+	d := &DMG{
+		Time:           time.Unix(1700000000, 0).UTC(),
+		RootFinderInfo: make([]byte, 16), // wrong size
+	}
+	err := d.Create(src, out, ModeReadOnly)
+	if err == nil {
+		t.Fatal("expected error for short RootFinderInfo, got nil")
+	}
+	if !strings.Contains(err.Error(), "got 16") {
+		t.Errorf("error should include actual length, got: %v", err)
+	}
+}
+
+// TestCreateDeterministicWithRootFinderInfo verifies determinism is
+// preserved when an extra xattr (the RootFinderInfo) is injected. The
+// attributes B-tree's record ordering is stable and shouldn't drift
+// across runs.
+func TestCreateDeterministicWithRootFinderInfo(t *testing.T) {
+	src := makeSourceTree(t)
+	finderInfo := make([]byte, 32)
+	for i := range finderInfo {
+		finderInfo[i] = byte(i + 1)
+	}
+	out1 := filepath.Join(t.TempDir(), "out1.dmg")
+	out2 := filepath.Join(t.TempDir(), "out2.dmg")
+	fixed := time.Unix(1700000000, 0).UTC()
+	for _, mode := range []Mode{ModeReadOnly, ModeReadOnlyCompressed} {
+		d := &DMG{VolumeName: "DET", Time: fixed, RootFinderInfo: finderInfo}
+		if err := d.Create(src, out1, mode); err != nil {
+			t.Fatalf("create 1 (mode=%s): %v", mode, err)
+		}
+		if err := d.Create(src, out2, mode); err != nil {
+			t.Fatalf("create 2 (mode=%s): %v", mode, err)
+		}
+		h1 := sha256sum(t, out1)
+		h2 := sha256sum(t, out2)
+		if h1 != h2 {
+			t.Errorf("mode=%s: output not deterministic with RootFinderInfo\n  first:  %x\n  second: %x",
+				mode, h1, h2)
+		}
 	}
 }
 

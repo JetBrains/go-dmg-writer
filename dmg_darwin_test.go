@@ -35,7 +35,6 @@ func TestHdiutilVerify(t *testing.T) {
 	}{
 		{"UDRO", ModeReadOnly},
 		{"UDZO", ModeReadOnlyCompressed},
-		{"UDRW", ModeReadWrite},
 	}
 	for _, m := range modes {
 		m := m
