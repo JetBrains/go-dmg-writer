@@ -18,24 +18,20 @@ permissions:
 # Pipeline shape:
 #
 #   lint
-#    ├─ build-linux  ──▶ test-linux
-#    ├─ build-macos  ──▶ test-macos
-#    └─ build-windows ──▶ test-windows
+#    -> build-linux  -> test-linux
+#    -> build-macos  -> test-macos
+#    -> build-windows -> test-windows
 #
 # `lint` is the gate: a gofmt or vet failure cancels everything else
 # before any platform spins up a runner. Each platform then has its own
 # build job which gates that platform's test job, so a Linux build
 # failure does not stop the macOS or Windows pipelines.
-#
-# We pin a single Go version (matched to go.mod's `go` directive). If the
-# project ever needs to support an older floor, reintroduce a strategy
-# matrix on `go-version` and bump go.mod accordingly.
 
 env:
   GO_VERSION: '1.23'
 
 jobs:
-  # ───────────────────────── Lint gate ─────────────────────────
+  # Lint
   lint:
     name: lint
     runs-on: ubuntu-latest
@@ -68,7 +64,7 @@ jobs:
         # without needing a full build matrix.
         run: go vet -tags=large ./...
 
-  # ───────────────────────── Linux ─────────────────────────────
+  # Linux
   build-linux:
     name: build (ubuntu)
     needs: lint
@@ -87,8 +83,8 @@ jobs:
     needs: build-linux
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
@@ -100,7 +96,7 @@ jobs:
       - name: go test -race
         run: go test -race -count=1 ./...
 
-  # ───────────────────────── macOS ─────────────────────────────
+  # macOS
   build-macos:
     name: build (macos)
     needs: lint
@@ -135,7 +131,7 @@ jobs:
       - name: hdiutil / fsck_hfs end-to-end
         run: go test -count=1 -run 'TestHdiutilVerify|TestFsckHFS|TestMountAndCompare' .
 
-  # ───────────────────────── Windows ───────────────────────────
+  # Windows
   build-windows:
     name: build (windows)
     needs: lint
