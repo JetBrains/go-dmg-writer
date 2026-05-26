@@ -1,4 +1,4 @@
-# go-dmg
+# go-dmg-writer
 
 A pure-Go, cross-platform writer for Apple's UDIF (`.dmg`) disk images
 containing an HFS+ filesystem.
