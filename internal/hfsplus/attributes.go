@@ -8,9 +8,9 @@ import (
 
 // Attribute record types (HFSPlusAttrRecord.recordType field).
 const (
-	AttrRecordInline      uint32 = 0x10 // kHFSPlusAttrInlineData
-	AttrRecordForkData    uint32 = 0x20 // kHFSPlusAttrForkData (not used in MVP)
-	AttrRecordExtents     uint32 = 0x30 // kHFSPlusAttrExtents (not used in MVP)
+	AttrRecordInline   uint32 = 0x10 // kHFSPlusAttrInlineData
+	AttrRecordForkData uint32 = 0x20 // kHFSPlusAttrForkData (not used in MVP)
+	AttrRecordExtents  uint32 = 0x30 // kHFSPlusAttrExtents (not used in MVP)
 )
 
 // Attr is one extended attribute attached to some catalog entry.

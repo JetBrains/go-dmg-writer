@@ -42,11 +42,11 @@ func (m *memWriteSeeker) Seek(off int64, whence int) (int64, error) {
 
 func mkRoot(macTime uint32) *Entry {
 	e := &Entry{
-		CNID:             CNIDRootFolder,
-		ParentCNID:       CNIDRootParent,
-		Kind:             KindFolder,
-		Mode:             0o40755,
-		OwnerID:          99, GroupID: 99,
+		CNID:       CNIDRootFolder,
+		ParentCNID: CNIDRootParent,
+		Kind:       KindFolder,
+		Mode:       0o40755,
+		OwnerID:    99, GroupID: 99,
 		CreateTime:       macTime,
 		ContentModTime:   macTime,
 		AttributeModTime: macTime,
@@ -66,12 +66,12 @@ func TestWriteVolumeSmallImage(t *testing.T) {
 	name, _ := NewName("hello.txt")
 	const helloContent = "hello world\n"
 	file := &Entry{
-		CNID:             16,
-		ParentCNID:       CNIDRootFolder,
-		Name:             name,
-		Kind:             KindFile,
-		Mode:             0o100644,
-		OwnerID:          99, GroupID: 99,
+		CNID:       16,
+		ParentCNID: CNIDRootFolder,
+		Name:       name,
+		Kind:       KindFile,
+		Mode:       0o100644,
+		OwnerID:    99, GroupID: 99,
 		CreateTime:       macTime,
 		ContentModTime:   macTime,
 		AttributeModTime: macTime,
@@ -148,16 +148,16 @@ func TestWriteVolumeWritesToFile(t *testing.T) {
 	}
 }
 
-func TestEntryEncoding(t *testing.T) {
+func TestEntryTextEncodingHint(t *testing.T) {
 	asciiName, _ := NewName("hello")
 	utfName, _ := NewName("héllo")
 
 	e1 := &Entry{Name: asciiName}
-	if e1.EncodingBit() != 0 {
-		t.Errorf("ASCII encoding bit: got %d want 0", e1.EncodingBit())
+	if got := e1.TextEncodingHint(); got != 0 {
+		t.Errorf("ASCII text encoding: got %d want 0", got)
 	}
 	e2 := &Entry{Name: utfName}
-	if e2.EncodingBit() != 0x7F {
-		t.Errorf("non-ASCII encoding bit: got %d want 0x7F", e2.EncodingBit())
+	if got := e2.TextEncodingHint(); got != 0x7F {
+		t.Errorf("non-ASCII text encoding: got %d want 0x7F", got)
 	}
 }

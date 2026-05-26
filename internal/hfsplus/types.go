@@ -2,8 +2,8 @@ package hfsplus
 
 import "encoding/binary"
 
-// Volume signature: "HX" for HFSX (case-sensitive, binary-compare catalog).
-// We use HFSX because it lets us sort catalog keys with simple
+// VolumeSignature "HX" for HFSX (case-sensitive, binary-compare catalog).
+// We use HFSX because it lets us sort catalog keys with a simple
 // codepoint-by-codepoint binary comparison (no need to implement Apple's
 // case-folding table). HFSX is a strict superset of HFS+ and is mountable
 // and notarizable on every macOS release since 10.3.
@@ -14,28 +14,28 @@ const VolumeVersion uint16 = 5
 
 // Reserved catalog node IDs (TN1150 §"Reserved CNIDs").
 const (
-	CNIDRootParent   uint32 = 1
-	CNIDRootFolder   uint32 = 2
-	CNIDExtents      uint32 = 3
-	CNIDCatalog      uint32 = 4
-	CNIDBadBlock     uint32 = 5
-	CNIDAllocation   uint32 = 6
-	CNIDStartup      uint32 = 7
-	CNIDAttributes   uint32 = 8
-	CNIDFirstUser    uint32 = 16
+	CNIDRootParent uint32 = 1
+	CNIDRootFolder uint32 = 2
+	CNIDExtents    uint32 = 3
+	CNIDCatalog    uint32 = 4
+	CNIDBadBlock   uint32 = 5
+	CNIDAllocation uint32 = 6
+	CNIDStartup    uint32 = 7
+	CNIDAttributes uint32 = 8
+	CNIDFirstUser  uint32 = 16
 )
 
 // Volume attribute bits.
 const (
-	VolHardwareLock        uint32 = 1 << 7
-	VolUnmounted           uint32 = 1 << 8  // kHFSVolumeUnmountedBit
-	VolSparedBlocks        uint32 = 1 << 9
-	VolNoCacheRequired     uint32 = 1 << 10
+	VolHardwareLock           uint32 = 1 << 7
+	VolUnmounted              uint32 = 1 << 8 // kHFSVolumeUnmountedBit
+	VolSparedBlocks           uint32 = 1 << 9
+	VolNoCacheRequired        uint32 = 1 << 10
 	VolBootVolumeInconsistent uint32 = 1 << 11
-	VolCNIDsReused         uint32 = 1 << 12
-	VolJournaled           uint32 = 1 << 13
-	VolSoftwareLock        uint32 = 1 << 15
-	VolUnusedNodeFix       uint32 = 1 << 31
+	VolCNIDsReused            uint32 = 1 << 12
+	VolJournaled              uint32 = 1 << 13
+	VolSoftwareLock           uint32 = 1 << 15
+	VolUnusedNodeFix          uint32 = 1 << 31
 )
 
 // SectorSize is the HFS+ physical sector (always 512).
@@ -89,13 +89,13 @@ type VolumeHeader struct {
 	FileCount   uint32
 	FolderCount uint32
 
-	BlockSize       uint32
-	TotalBlocks     uint32
-	FreeBlocks      uint32
-	NextAllocation  uint32
-	RsrcClumpSize   uint32
-	DataClumpSize   uint32
-	NextCatalogID   uint32
+	BlockSize      uint32
+	TotalBlocks    uint32
+	FreeBlocks     uint32
+	NextAllocation uint32
+	RsrcClumpSize  uint32
+	DataClumpSize  uint32
+	NextCatalogID  uint32
 
 	WriteCount      uint32
 	EncodingsBitmap uint64
@@ -167,15 +167,15 @@ const (
 
 // BTHeader attributes.
 const (
-	BTBadCloseMask     uint32 = 1 << 0
-	BTBigKeysMask      uint32 = 1 << 1
+	BTBadCloseMask      uint32 = 1 << 0
+	BTBigKeysMask       uint32 = 1 << 1
 	BTVariableIndexKeys uint32 = 1 << 2
 )
 
 // BTreeType values.
 const (
-	BTreeHFSType     uint8 = 0
-	BTreeUserBTree   uint8 = 128
+	BTreeHFSType      uint8 = 0
+	BTreeUserBTree    uint8 = 128
 	BTreeReservedType uint8 = 255
 )
 
@@ -246,18 +246,18 @@ func (h *BTHeaderRec) encode(b []byte) {
 
 // Catalog record types (16-bit values in HFSPlusCatalogRecord).
 const (
-	RecTypeFolder        int16 = 0x0001
-	RecTypeFile          int16 = 0x0002
-	RecTypeFolderThread  int16 = 0x0003
-	RecTypeFileThread    int16 = 0x0004
+	RecTypeFolder       int16 = 0x0001
+	RecTypeFile         int16 = 0x0002
+	RecTypeFolderThread int16 = 0x0003
+	RecTypeFileThread   int16 = 0x0004
 )
 
 // Catalog flag bits.
 const (
-	CatFlagFileLocked    uint16 = 0x0001
-	CatFlagThreadExists  uint16 = 0x0002
-	CatFlagHasAttributes uint16 = 0x0004
-	CatFlagHasSecurity   uint16 = 0x0008
+	CatFlagFileLocked     uint16 = 0x0001
+	CatFlagThreadExists   uint16 = 0x0002
+	CatFlagHasAttributes  uint16 = 0x0004
+	CatFlagHasSecurity    uint16 = 0x0008
 	CatFlagHasFolderCount uint16 = 0x0010
 )
 
@@ -283,7 +283,7 @@ func (i *BSDInfo) encode(b []byte) {
 	binary.BigEndian.PutUint32(b[12:16], i.Special)
 }
 
-// Finder file info (16 bytes) + extended (16 bytes). We zero them by
+// FileInfo of Finder (16 bytes) + extended (16 bytes). We zero them by
 // default and only fill them in for special cases (e.g. symlinks).
 type FileInfo struct {
 	FileType    uint32
@@ -353,7 +353,7 @@ func (i *ExtendedFolderInfo) encode(b []byte) {
 
 // CatalogFolder is the wire form of a kHFSPlusFolderRecord.
 type CatalogFolder struct {
-	RecordType       int16  // RecTypeFolder
+	RecordType       int16 // RecTypeFolder
 	Flags            uint16
 	Valence          uint32 // count of immediate children
 	FolderID         uint32

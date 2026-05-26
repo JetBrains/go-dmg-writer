@@ -145,17 +145,17 @@ func WriteVolume(out io.WriteSeeker, in *VolumeInputs) (volumeSize uint64, err e
 		return 0, err
 	}
 
-	// 6. Write the primary volume header at byte 1024.
+	// 7. Write the primary volume header at byte 1024.
 	if err := writeAt(out, 1024, vh.Encode()); err != nil {
 		return 0, err
 	}
 
-	// 7. Write the allocation bitmap.
+	// 8. Write the allocation bitmap.
 	if err := writeAt(out, int64(plan.AllocStartBlock)*int64(plan.BlockSize), plan.AllocBitmap.Bytes()); err != nil {
 		return 0, err
 	}
 
-	// 8. Write the three system B-trees.
+	// 9. Write the three system B-trees.
 	if err := writeAt(out, int64(plan.CatalogStartBlock)*int64(plan.BlockSize), catRes.Bytes); err != nil {
 		return 0, err
 	}
@@ -166,7 +166,7 @@ func WriteVolume(out io.WriteSeeker, in *VolumeInputs) (volumeSize uint64, err e
 		return 0, err
 	}
 
-	// 9. Stream every user file into its allotted blocks.
+	// 10. Stream every user file into its allotted blocks.
 	for i, u := range in.UserFiles {
 		p := plan.Placements[i]
 		if p.Blocks == 0 {
@@ -178,7 +178,7 @@ func WriteVolume(out io.WriteSeeker, in *VolumeInputs) (volumeSize uint64, err e
 		}
 	}
 
-	// 10. Write the alternate volume header at volumeSize-1024.
+	// 11. Write the alternate volume header at volumeSize-1024.
 	if err := writeAt(out, int64(volumeSize)-1024, vh.Encode()); err != nil {
 		return 0, err
 	}
