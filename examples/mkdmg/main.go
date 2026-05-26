@@ -22,7 +22,7 @@ func main() {
 	var (
 		srcFlag  = flag.String("src", "", "source folder (required)")
 		outFlag  = flag.String("out", "", "output .dmg path (required)")
-		modeFlag = flag.String("mode", "udzo", "output mode: udrw | udro | udzo")
+		modeFlag = flag.String("mode", "udzo", "output mode: udro | udzo")
 		nameFlag = flag.String("name", "disk image", "volume name as it appears in Finder")
 		timeFlag = flag.Int64("time", 0, "Unix timestamp baked into the volume (0 = now)")
 	)
@@ -34,14 +34,12 @@ func main() {
 
 	var mode dmg.Mode
 	switch strings.ToLower(*modeFlag) {
-	case "udrw":
-		mode = dmg.ModeReadWrite
 	case "udro":
 		mode = dmg.ModeReadOnly
 	case "udzo":
 		mode = dmg.ModeReadOnlyCompressed
 	default:
-		log.Fatalf("unknown -mode %q (want udrw, udro, or udzo)", *modeFlag)
+		log.Fatalf("unknown -mode %q (want udro or udzo)", *modeFlag)
 	}
 
 	var when time.Time
