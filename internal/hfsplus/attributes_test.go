@@ -2,6 +2,7 @@ package hfsplus
 
 import (
 	"encoding/binary"
+	"strings"
 	"testing"
 )
 
@@ -62,5 +63,56 @@ func TestEncodeInlineAttrData(t *testing.T) {
 	}
 	if string(d[16:19]) != "abc" {
 		t.Errorf("body: %q", d[16:19])
+	}
+}
+
+// TestBuildAttributesTreeNameAtBoundary confirms that an xattr name
+// whose UTF-16 length is exactly MaxAttrNameRunes is accepted: this is
+// the largest length fsck_hfs tolerates without flagging an error.
+func TestBuildAttributesTreeNameAtBoundary(t *testing.T) {
+	name := strings.Repeat("a", MaxAttrNameRunes)
+	if _, err := BuildAttributesTree([]Attr{{
+		FileID: 16,
+		Name:   name,
+		Data:   []byte("x"),
+	}}); err != nil {
+		t.Fatalf("BuildAttributesTree at exactly MaxAttrNameRunes: %v", err)
+	}
+}
+
+// TestBuildAttributesTreeNameOverBoundary confirms that an xattr name
+// one rune too long is rejected with a name-length error.
+func TestBuildAttributesTreeNameOverBoundary(t *testing.T) {
+	name := strings.Repeat("a", MaxAttrNameRunes+1)
+	_, err := BuildAttributesTree([]Attr{{
+		FileID: 16,
+		Name:   name,
+		Data:   []byte("x"),
+	}})
+	if err == nil {
+		t.Fatal("expected error for name over MaxAttrNameRunes, got nil")
+	}
+	if !strings.Contains(err.Error(), "name") {
+		t.Errorf("error should mention name, got: %v", err)
+	}
+}
+
+// TestBuildAttributesTreeOversizeData confirms that an inline attr body
+// that wouldn't fit in a single attributes B-tree node is rejected up
+// front rather than silently truncated.
+func TestBuildAttributesTreeOversizeData(t *testing.T) {
+	// Use a value comfortably larger than the inline limit to avoid
+	// off-by-one fragility against the helper's exact bookkeeping.
+	oversize := make([]byte, int(AttributesNodeSize))
+	_, err := BuildAttributesTree([]Attr{{
+		FileID: 16,
+		Name:   "com.apple.x",
+		Data:   oversize,
+	}})
+	if err == nil {
+		t.Fatal("expected error for oversize attr data, got nil")
+	}
+	if !strings.Contains(err.Error(), "inline limit") {
+		t.Errorf("error should mention inline limit, got: %v", err)
 	}
 }

@@ -10,7 +10,10 @@ import (
 )
 
 // fakeSrc generates n bytes following a known pattern for round-trip tests.
-type fakeSrc struct{ buf []byte; off int }
+type fakeSrc struct {
+	buf []byte
+	off int
+}
 
 func newFakeSrc(n int) *fakeSrc {
 	b := make([]byte, n)
