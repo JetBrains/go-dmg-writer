@@ -1,4 +1,4 @@
-# go-dmg-writer
+# go-dmg
 
 A pure-Go, cross-platform writer for Apple's UDIF (`.dmg`) disk images
 containing an HFS+ filesystem.
@@ -22,11 +22,7 @@ func main() {
   no `hdiutil` shell-out, no external dependencies beyond
   `golang.org/x/text` (for Unicode normalization) and `golang.org/x/sys`
   (for reading source-side xattrs on POSIX).
-- **Three output modes**:
-  - `ModeReadWrite` (UDRW) — uncompressed, raw, mountable read-write.
-    Useful while iterating. Not suitable for distribution because any
-    modification invalidates the UDIF data-fork CRC32 and notarization
-    refuses non-read-only DMGs.
+- **Two output modes**:
   - `ModeReadOnly` (UDRO) — uncompressed UDIF, read-only at mount time.
   - `ModeReadOnlyCompressed` (UDZO) — per-chunk zlib compression. This is
     the format you want for shipping signed and notarized apps.
@@ -37,15 +33,51 @@ func main() {
   `Time`, repeated runs produce byte-identical DMGs (useful for
   reproducible builds and CI caching).
 
+## Licensing
+
+This project is licensed under the Apache License 2.0. It is a clean-room
+implementation from Apple TN1150 (HFS+) and public UDIF documentation; no
+code or constants were copied from any GPL-licensed source. You are free
+to use it inside closed-source applications.
+
 ## Status
 
 Format support is engineered to pass `hdiutil verify` and `fsck_hfs -fn`
 so the produced images survive `codesign` + `notarytool submit`.
 
-## Limitations
+## Caveats and limitations
+
+- **The produced volume is HFSX, not classic HFS+.** HFSX is HFS+ with
+  binary (case-sensitive) catalog comparison and is mountable on every
+  macOS release since 10.3. Most app bundles, frameworks, and assets are
+  case-correct already and mount cleanly. A handful of legacy apps —
+  typically older installers ported from Windows — depend on
+  case-insensitive lookups (e.g. opening `Foo.PNG` when the file on disk
+  is `foo.png`) and will fail on a `go-dmg`-built image. If your app
+  is one of those, you have to rebuild the bundle with consistent
+  casing or use Apple's `hdiutil`.
+- **Owner / group defaults are root (UID 0).** The struct's zero-valued
+  `OwnerID` / `GroupID` are taken literally as UID/GID 0. Set them to
+  `dmg.OwnerIDUnset` to get the conventional `hdiutil` "unknown user"
+  (99) behavior, which is what you typically want for distribution
+  DMGs that should mount with the same permissions on any host.
+- **POSIX mode bits are meaningless when built on Windows.** Go reports
+  synthetic `0o666`/`0o777` values from `os.FileMode.Perm()` on
+  Windows; those bytes are written verbatim into the catalog.
+- **Hard links are silently duplicated.** The walker uses `os.Lstat`
+  and treats every directory entry as a unique file. Two hard links
+  pointing at the same inode become two independent catalog entries
+  with their own copy of the data. For read-only distribution DMGs
+  this is benign; consolidate hard links before calling `Create` if it
+  isn't.
+- **Symlink targets are stored verbatim.** On Windows, `os.Readlink`
+  returns paths with backslash separators; those bytes go onto the
+  volume unchanged. Mounting that image on macOS will not resolve
+  absolute Windows-style targets.
+
+## Not implemented
 
 - HFS+ journaling (deprecated for distribution images)
-- Hard links
 - Resource forks (modern code signing lives inside the bundle, not in
   resource forks)
 - FileVault encryption
@@ -57,21 +89,4 @@ so the produced images survive `codesign` + `notarytool submit`.
 
 ```
 $ go run ./examples/mkdmg -src ./build/MyApp -out MyApp.dmg -mode udzo -name MyApp
-```
-
-## License
-```
-   Copyright 2026 JetBrains s.r.o. 
-
-   Licensed under the Apache License, Version 2.0 (the "License");
-   you may not use this file except in compliance with the License.
-   You may obtain a copy of the License at
-
-       http://www.apache.org/licenses/LICENSE-2.0
-
-   Unless required by applicable law or agreed to in writing, software
-   distributed under the License is distributed on an "AS IS" BASIS,
-   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-   See the License for the specific language governing permissions and
-   limitations under the License.
 ```
