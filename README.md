@@ -33,19 +33,7 @@ func main() {
   `Time`, repeated runs produce byte-identical DMGs (useful for
   reproducible builds and CI caching).
 
-## Licensing
-
-This project is licensed under the Apache License 2.0. It is a clean-room
-implementation from Apple TN1150 (HFS+) and public UDIF documentation; no
-code or constants were copied from any GPL-licensed source. You are free
-to use it inside closed-source applications.
-
-## Status
-
-Format support is engineered to pass `hdiutil verify` and `fsck_hfs -fn`
-so the produced images survive `codesign` + `notarytool submit`.
-
-## Caveats and limitations
+## Limitations
 
 - **The produced volume is HFSX, not classic HFS+.** HFSX is HFS+ with
   binary (case-sensitive) catalog comparison and is mountable on every
@@ -85,8 +73,19 @@ so the produced images survive `codesign` + `notarytool submit`.
   matching `hdiutil create -srcfolder -format UDZO`)
 - Reading existing DMGs (this library only writes)
 
-## Example CLI
-
+## License
 ```
-$ go run ./examples/mkdmg -src ./build/MyApp -out MyApp.dmg -mode udzo -name MyApp
+   Copyright 2026 JetBrains s.r.o.
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
 ```
