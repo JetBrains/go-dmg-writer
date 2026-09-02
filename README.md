@@ -29,6 +29,11 @@ func main() {
 - **Minimal extended attributes** — passes through `com.apple.quarantine`
   and other small xattrs found on source files, plus an optional
   `RootFinderInfo` field for setting a custom volume icon / Finder window.
+- **Optional GUID partition table** — set `PartitionMap: true` to frame the
+  volume as a whole disk (protective MBR, primary and backup GPT, one
+  `Apple_HFS` partition), matching `hdiutil create -layout GPTSPUD`. macOS
+  mounts a map-less image fine; the map is what a tool that *parses* a
+  `.dmg` without mounting it needs.
 - **Deterministic output** — given the same source folder and a fixed
   `Time`, repeated runs produce byte-identical DMGs (useful for
   reproducible builds and CI caching).
@@ -69,8 +74,9 @@ func main() {
 - Resource forks (modern code signing lives inside the bundle, not in
   resource forks)
 - FileVault encryption
-- Apple Partition Map / GPT prefix (we emit partition-image DMGs,
-  matching `hdiutil create -srcfolder -format UDZO`)
+- Apple Partition Map (GPT is supported, see `PartitionMap` above; the
+  default is a partition-image DMG, matching
+  `hdiutil create -srcfolder -format UDZO`)
 - Reading existing DMGs (this library only writes)
 
 ## License
