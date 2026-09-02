@@ -3,6 +3,8 @@ package dmg
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/binary"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -11,6 +13,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jetbrains/go-dmg-writer/internal/gpt"
+	"github.com/jetbrains/go-dmg-writer/internal/hfsplus"
 	"github.com/jetbrains/go-dmg-writer/internal/udif"
 )
 
@@ -365,4 +369,123 @@ func sha256sum(t *testing.T, path string) [32]byte {
 	var out [32]byte
 	copy(out[:], h.Sum(nil))
 	return out
+}
+
+// TestCreatePartitionMap checks the GPT framing end to end: the UDRO
+// data fork is the raw disk, so the protective MBR, the primary header
+// and the partition entry are readable straight out of the file, and
+// the volume has to land at the partition's first LBA.
+func TestCreatePartitionMap(t *testing.T) {
+	src := makeSourceTree(t)
+	dir := t.TempDir()
+	bare, framed := filepath.Join(dir, "bare.dmg"), filepath.Join(dir, "framed.dmg")
+
+	when := time.Unix(1700000000, 0).UTC()
+	if err := (&DMG{VolumeName: "TEST", Time: when}).Create(src, bare, ModeReadOnly); err != nil {
+		t.Fatalf("Create without a map: %v", err)
+	}
+	if err := (&DMG{VolumeName: "TEST", Time: when, PartitionMap: true}).Create(src, framed, ModeReadOnly); err != nil {
+		t.Fatalf("Create with a map: %v", err)
+	}
+	checkDMG(t, framed /*compressed*/, false)
+
+	// The map is the only difference: the same volume, plus the leading
+	// and trailing sectors the framing costs.
+	bareSectors, framedSectors := readKoly(t, bare).SectorCount, readKoly(t, framed).SectorCount
+	if want := bareSectors + gpt.PartitionStartLBA + gpt.BackupSectors; framedSectors != want {
+		t.Errorf("framed sector count: got %d want %d (%d volume sectors plus the map)", framedSectors, want, bareSectors)
+	}
+
+	// The KOLY keeps saying "partition" even though the data fork is
+	// now a whole disk: hdiutil refuses an image whose variant is
+	// "device" unless the resource fork also splits the BLKX table
+	// per region, which this writer does not do. See the gpt package
+	// doc.
+	if got := readKoly(t, framed).ImageVariant; got != udif.ImageVariantPartition {
+		t.Errorf("framed ImageVariant: got %d want %d (partition)", got, udif.ImageVariantPartition)
+	}
+
+	head := readAt(t, framed, 0, (gpt.PartitionStartLBA+2)*gpt.SectorSize)
+	if got := head[510:512]; !bytes.Equal(got, []byte{0x55, 0xAA}) {
+		t.Errorf("protective MBR signature: got %v want [85 170]", got)
+	}
+	if got := head[450]; got != 0xEE {
+		t.Errorf("MBR partition type: got %#x want 0xee, the GPT protective type", got)
+	}
+	if got := string(head[gpt.SectorSize : gpt.SectorSize+8]); got != "EFI PART" {
+		t.Errorf("primary GPT header: got %q want \"EFI PART\"", got)
+	}
+
+	entry := head[2*gpt.SectorSize:][:gpt.EntrySize]
+	if !bytes.Equal(entry[0:16], gpt.AppleHFSTypeGUID[:]) {
+		t.Errorf("partition type GUID: got %v want the Apple HFS GUID %v", entry[0:16], gpt.AppleHFSTypeGUID)
+	}
+	if got := binary.LittleEndian.Uint64(entry[32:40]); got != gpt.PartitionStartLBA {
+		t.Errorf("partition first LBA: got %d want %d", got, gpt.PartitionStartLBA)
+	}
+	if got, want := binary.LittleEndian.Uint64(entry[40:48]), gpt.PartitionStartLBA+bareSectors-1; got != want {
+		t.Errorf("partition last LBA: got %d want %d", got, want)
+	}
+
+	// The volume header sits 1024 bytes into the volume, which now sits
+	// at the partition's first LBA rather than at offset 0.
+	vh := readAt(t, framed, gpt.PartitionStartLBA*gpt.SectorSize+1024, 2)
+	if got := binary.BigEndian.Uint16(vh); got != hfsplus.VolumeSignature {
+		t.Errorf("HFSX signature at the partition start: got %#x want %#x", got, hfsplus.VolumeSignature)
+	}
+	// And the backup header closes the last sector of the disk.
+	last := readAt(t, framed, int64(framedSectors-1)*gpt.SectorSize, 8)
+	if got := string(last); got != "EFI PART" {
+		t.Errorf("backup GPT header in the last sector: got %q want \"EFI PART\"", got)
+	}
+}
+
+// TestCreatePartitionMapDeterministic guards the reproducible build: the
+// framing carries no timestamp and no random GUID.
+func TestCreatePartitionMapDeterministic(t *testing.T) {
+	src := makeSourceTree(t)
+	dir := t.TempDir()
+	when := time.Unix(1700000000, 0).UTC()
+
+	var sums [2][32]byte
+	for i := range sums {
+		out := filepath.Join(dir, fmt.Sprintf("run%d.dmg", i))
+		d := &DMG{VolumeName: "TEST", Time: when, PartitionMap: true}
+		if err := d.Create(src, out, ModeReadOnlyCompressed); err != nil {
+			t.Fatalf("Create run %d: %v", i, err)
+		}
+		sums[i] = sha256sum(t, out)
+	}
+	if sums[0] != sums[1] {
+		t.Errorf("two runs with a partition map differ: %x != %x", sums[0], sums[1])
+	}
+}
+
+// readKoly decodes the trailing KOLY block of a finished image.
+func readKoly(t *testing.T, path string) *udif.Koly {
+	t.Helper()
+	st, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	koly, err := udif.DecodeKoly(readAt(t, path, st.Size()-int64(udif.KolySize), udif.KolySize))
+	if err != nil {
+		t.Fatalf("DecodeKoly: %v", err)
+	}
+	return koly
+}
+
+// readAt reads n bytes from off, and fails the test if it cannot.
+func readAt(t *testing.T, path string, off int64, n int) []byte {
+	t.Helper()
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	buf := make([]byte, n)
+	if _, err := f.ReadAt(buf, off); err != nil {
+		t.Fatalf("ReadAt(%s, %d, %d): %v", path, off, n, err)
+	}
+	return buf
 }
