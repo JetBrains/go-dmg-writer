@@ -129,7 +129,7 @@ jobs:
       # they only compile on macOS; running them explicitly here makes
       # failures impossible to miss in the test output.
       - name: hdiutil / fsck_hfs end-to-end
-        run: go test -count=1 -run 'TestHdiutilVerify|TestFsckHFS|TestMountAndCompare' .
+        run: go test -count=1 -run 'TestHdiutilVerify|TestFsckHFS|TestMountAndCompare|TestPartitionMapAttachAndFsck' .
 
   # Windows
   build-windows:
