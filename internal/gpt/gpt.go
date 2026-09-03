@@ -1,5 +1,5 @@
 // Package gpt frames a bare HFS+ volume as a whole disk: protective MBR,
-// primary GUID Partition Table, volume, backup table — the geometry
+// primary GUID Partition Table, volume, backup table: the geometry
 // `hdiutil create -layout GPTSPUD` writes. macOS mounts a map-less image
 // fine; the map is for readers that parse a `.dmg` without mounting it.
 // Write-once and little-endian, unlike the big-endian UDIF wrapper.
@@ -19,24 +19,53 @@ import (
 // assume.
 const SectorSize = 512
 
-// PartitionStartLBA is where the payload starts. 34 is the GPT minimum;
-// Apple starts at 40 and leaves 34..39 unused, so we do too.
-const PartitionStartLBA = 40
-
-// FirstUsableLBA is the first LBA outside the primary map, as the header
-// reports it — not where the partition starts.
-const FirstUsableLBA = 34
-
-// BackupSectors is the trailing map: 32 sectors of entries plus the
-// backup header in the very last sector.
-const BackupSectors = 33
-
 // Geometry of the entry array and the header, in the header's own units.
 const (
 	EntryCount    = 128
 	EntrySize     = 128
 	EntryArrayLen = EntryCount * EntrySize
 	HeaderLen     = 92
+
+	// EntryArraySectors is how many sectors the entry array occupies.
+	// Every LBA below derives from it, so changing EntryCount or
+	// EntrySize moves the map and the header together instead of
+	// letting them drift apart.
+	EntryArraySectors = EntryArrayLen / SectorSize
+)
+
+// The map's fixed LBAs. Sector 0 is the protective MBR and sector 1 the
+// primary header, so the entry array starts at 2 and everything after it
+// follows from its size.
+const (
+	// EntryArrayLBA is where the primary entry array starts.
+	EntryArrayLBA = 2
+	// FirstUsableLBA is the first LBA outside the primary map, as the
+	// header reports it, which is not where the partition starts.
+	FirstUsableLBA = EntryArrayLBA + EntryArraySectors
+	// BackupSectors is the trailing map: the backup entry array plus the
+	// backup header in the very last sector.
+	BackupSectors = EntryArraySectors + 1
+)
+
+// PartitionStartLBA is where the payload starts. [FirstUsableLBA] is the
+// GPT minimum; Apple starts at 40 and leaves the sectors in between
+// unused, so we do too.
+const PartitionStartLBA = 40
+
+// Location of the partition name inside one entry: UTF-16LE, not
+// NUL-terminated, and not the volume name Finder shows.
+const (
+	entryNameOffset = 56
+	entryNameLen    = EntrySize - entryNameOffset
+)
+
+// Compile-time guards on the geometry above. Each is a negative constant
+// (so the build fails on the uint conversion) the moment an invariant the
+// rest of this file assumes stops holding.
+const (
+	_ = uint(EntryArraySectors*SectorSize - EntryArrayLen) // the entry array is a whole number of sectors
+	_ = uint(PartitionStartLBA - FirstUsableLBA)           // the payload starts outside the primary map
+	_ = uint(entryNameLen - 2*len(partitionName))          // the partition name fits its field
 )
 
 // AppleHFSTypeGUID is 48465300-0000-11AA-AA11-00306543ECAC, Apple's
@@ -60,9 +89,11 @@ var ErrEmptyVolume = errors.New("gpt: cannot partition an empty volume")
 type Layout struct {
 	volumeSectors uint64
 	totalSectors  uint64
-	// name and when seed the GUIDs; see [Layout.guidFrom].
-	name string
-	when time.Time
+	// The GUIDs are derived from the seeds once in [New], rather than on
+	// every access, so the primary and the backup map cannot disagree and
+	// framing an image hashes twice instead of four times per call.
+	diskGUID      [16]byte
+	partitionGUID [16]byte
 }
 
 // New derives the geometry for a volume of volumeSize bytes; name and
@@ -76,11 +107,12 @@ func New(volumeSize uint64, name string, when time.Time) (Layout, error) {
 		return Layout{}, fmt.Errorf("gpt: volume size %d is not a whole number of %d-byte sectors", volumeSize, SectorSize)
 	}
 	sectors := volumeSize / SectorSize
+	total := PartitionStartLBA + sectors + BackupSectors
 	return Layout{
 		volumeSectors: sectors,
-		totalSectors:  PartitionStartLBA + sectors + BackupSectors,
-		name:          name,
-		when:          when,
+		totalSectors:  total,
+		diskGUID:      guidFrom("gpt:disk", name, when, total),
+		partitionGUID: guidFrom("gpt:partition", name, when, sectors),
 	}, nil
 }
 
@@ -95,7 +127,7 @@ func (l Layout) LeadingMap() []byte {
 
 	copy(out[:SectorSize], l.protectiveMBR())
 	copy(out[SectorSize:SectorSize+HeaderLen], l.header(entries, headerPrimary))
-	copy(out[2*SectorSize:2*SectorSize+EntryArrayLen], entries)
+	copy(out[EntryArrayLBA*SectorSize:EntryArrayLBA*SectorSize+EntryArrayLen], entries)
 	return out
 }
 
@@ -157,7 +189,7 @@ func (l Layout) header(entries []byte, role headerRole) []byte {
 	case headerBackup:
 		myLBA, alternateLBA, entryLBA = l.lastLBA(), 1, l.lastUsableLBA()+1
 	default:
-		myLBA, alternateLBA, entryLBA = 1, l.lastLBA(), 2
+		myLBA, alternateLBA, entryLBA = 1, l.lastLBA(), EntryArrayLBA
 	}
 
 	h := make([]byte, HeaderLen)
@@ -171,8 +203,7 @@ func (l Layout) header(entries []byte, role headerRole) []byte {
 	binary.LittleEndian.PutUint64(h[32:40], alternateLBA)
 	binary.LittleEndian.PutUint64(h[40:48], FirstUsableLBA)
 	binary.LittleEndian.PutUint64(h[48:56], l.lastUsableLBA())
-	diskGUID := l.diskGUID()
-	copy(h[56:72], diskGUID[:])
+	copy(h[56:72], l.diskGUID[:])
 	binary.LittleEndian.PutUint64(h[72:80], entryLBA)
 	binary.LittleEndian.PutUint32(h[80:84], EntryCount)
 	binary.LittleEndian.PutUint32(h[84:88], EntrySize)
@@ -186,40 +217,39 @@ func (l Layout) header(entries []byte, role headerRole) []byte {
 // stray second one breaks a reader that expects a single partition.
 func (l Layout) entryArray() []byte {
 	entries := make([]byte, EntryArrayLen)
-	e := entries[:EntrySize]
-	_ = e[127]
+	// Full slice expression: capping the capacity as well as the length
+	// is what confines a write to this entry. A plain entries[:EntrySize]
+	// would keep the whole array's capacity, and a slice expression is
+	// bounds-checked against capacity, so an overrun would land in the
+	// next entry instead of panicking.
+	e := entries[:EntrySize:EntrySize]
 
 	copy(e[0:16], AppleHFSTypeGUID[:])
-	partitionGUID := l.partitionGUID()
-	copy(e[16:32], partitionGUID[:])
+	copy(e[16:32], l.partitionGUID[:])
 	binary.LittleEndian.PutUint64(e[32:40], PartitionStartLBA)
 	binary.LittleEndian.PutUint64(e[40:48], l.partitionLastLBA())
 	// 48..56 is the attribute bitmask, unset for a plain data partition.
-	// 56..128 is the name, UTF-16LE in a 72-byte field.
+	// The name goes in the rest of the entry. name is capacity-capped to
+	// the field, so a name too long for it panics here instead of running
+	// on into the next entry; the compile-time guard on entryNameLen
+	// keeps even that unreachable.
+	name := e[entryNameOffset : entryNameOffset+entryNameLen : entryNameOffset+entryNameLen]
 	for i, unit := range utf16.Encode([]rune(partitionName)) {
-		binary.LittleEndian.PutUint16(e[56+2*i:58+2*i], unit)
+		binary.LittleEndian.PutUint16(name[2*i:2*i+2], unit)
 	}
 	return entries
 }
 
-// diskGUID and [Layout.partitionGUID] are derived, never random, so two
-// builds of the same input produce the same image.
-func (l Layout) diskGUID() [16]byte {
-	return l.guidFrom("gpt:disk", l.totalSectors)
-}
-
-func (l Layout) partitionGUID() [16]byte {
-	return l.guidFrom("gpt:partition", l.volumeSectors)
-}
-
-// guidFrom takes the first 16 bytes of SHA-256 over the seeds, matching
-// udif's segment ID. Nothing reads a GUID's version or variant bits.
-func (l Layout) guidFrom(tag string, sectors uint64) [16]byte {
+// guidFrom derives a GUID, never random, so two builds of the same input
+// produce the same image. It takes the first 16 bytes of SHA-256 over the
+// seeds, matching udif's segment ID; the tag separates the disk's GUID
+// from the partition's. Nothing reads a GUID's version or variant bits.
+func guidFrom(tag, name string, when time.Time, sectors uint64) [16]byte {
 	h := sha256.New()
 	h.Write([]byte(tag))
-	h.Write([]byte(l.name))
+	h.Write([]byte(name))
 	var num [8]byte
-	binary.BigEndian.PutUint64(num[:], uint64(l.when.Unix()))
+	binary.BigEndian.PutUint64(num[:], uint64(when.Unix()))
 	h.Write(num[:])
 	binary.BigEndian.PutUint64(num[:], sectors)
 	h.Write(num[:])
