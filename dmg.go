@@ -42,6 +42,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/jetbrains/go-dmg-writer/internal/gpt"
 	"github.com/jetbrains/go-dmg-writer/internal/hfsplus"
 	"github.com/jetbrains/go-dmg-writer/internal/udif"
 )
@@ -120,6 +121,19 @@ type DMG struct {
 	// prefer the latter.
 	OwnerID uint32
 	GroupID uint32
+	// PartitionMap frames the volume in a GUID partition table, so the
+	// image describes a whole disk: a protective MBR, a primary GPT and
+	// its backup copy, with the volume as the single Apple HFS
+	// partition. This is the layout `hdiutil create -layout GPTSPUD`
+	// produces.
+	//
+	// A reader that MOUNTS the image does not need the map, because
+	// macOS mounts a map-less image perfectly well. A reader that
+	// PARSES the image without mounting it cannot work without the map,
+	// because it starts at the partition map and has nowhere to go.
+	//
+	// The map costs 37 KiB of mostly zero sectors, which compress away.
+	PartitionMap bool
 }
 
 // Create writes a DMG to outPath containing every file under srcFolder.
@@ -208,6 +222,18 @@ func (d *DMG) Create(srcFolder, outPath string, mode Mode) (err error) {
 		return err
 	}
 
+	// The partition map goes between the volume and the UDIF wrapper.
+	// Derive it before the output file exists, so a volume size the map
+	// cannot describe leaves no truncated file behind (and does not
+	// clobber a good image from a previous run).
+	var layout gpt.Layout
+	if d.PartitionMap {
+		layout, err = gpt.New(volumeSize, volName, when)
+		if err != nil {
+			return fmt.Errorf("dmg: partition map: %w", err)
+		}
+	}
+
 	out, err := os.Create(outPath)
 	if err != nil {
 		return fmt.Errorf("dmg: open output: %w", err)
@@ -231,7 +257,23 @@ func (d *DMG) Create(srcFolder, outPath string, mode Mode) (err error) {
 		ChunkSectors: d.ChunkSectors,
 		Time:         when,
 	}
-	if err := udif.Write(out, scratch, int64(volumeSize), udifOpts); err != nil {
+
+	// udif.Write takes an io.Reader, so the two halves of the map stream
+	// in front of and behind the scratch file. There is no second pass
+	// and no second scratch file.
+	//
+	// The scratch reader is capped at volumeSize: the geometry the map
+	// describes is authoritative, and io.MultiReader would otherwise read
+	// the file to EOF, so a scratch file longer than the volume it
+	// reports would push the trailing map off its sector.
+	var src io.Reader = io.LimitReader(scratch, int64(volumeSize))
+	srcLen := int64(volumeSize)
+	if d.PartitionMap {
+		src = io.MultiReader(bytes.NewReader(layout.LeadingMap()), src, bytes.NewReader(layout.TrailingMap()))
+		srcLen = int64(layout.DiskSize())
+	}
+
+	if err := udif.Write(out, src, srcLen, udifOpts); err != nil {
 		return fmt.Errorf("dmg: wrap udif: %w", err)
 	}
 	return nil

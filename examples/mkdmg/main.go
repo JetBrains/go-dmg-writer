@@ -25,6 +25,7 @@ func main() {
 		modeFlag = flag.String("mode", "udzo", "output mode: udro | udzo")
 		nameFlag = flag.String("name", "disk image", "volume name as it appears in Finder")
 		timeFlag = flag.Int64("time", 0, "Unix timestamp baked into the volume (0 = now)")
+		gptFlag  = flag.Bool("gpt", false, "frame the volume in a GUID partition table")
 	)
 	flag.Parse()
 	if *srcFlag == "" || *outFlag == "" {
@@ -48,8 +49,9 @@ func main() {
 	}
 
 	d := &dmg.DMG{
-		VolumeName: *nameFlag,
-		Time:       when,
+		VolumeName:   *nameFlag,
+		Time:         when,
+		PartitionMap: *gptFlag,
 	}
 	if err := d.Create(*srcFlag, *outFlag, mode); err != nil {
 		log.Fatalf("dmg create: %v", err)

@@ -30,19 +30,23 @@ func TestHdiutilVerify(t *testing.T) {
 	src := makeSourceTreeWithSymlink(t)
 
 	modes := []struct {
-		name string
-		mode Mode
+		name         string
+		mode         Mode
+		partitionMap bool
 	}{
-		{"UDRO", ModeReadOnly},
-		{"UDZO", ModeReadOnlyCompressed},
+		{"UDRO", ModeReadOnly, false},
+		{"UDZO", ModeReadOnlyCompressed, false},
+		{"UDRO-GPT", ModeReadOnly, true},
+		{"UDZO-GPT", ModeReadOnlyCompressed, true},
 	}
 	for _, m := range modes {
 		m := m
 		t.Run(m.name, func(t *testing.T) {
 			out := filepath.Join(t.TempDir(), m.name+".dmg")
 			d := &DMG{
-				VolumeName: "verify-" + m.name,
-				Time:       time.Unix(1700000000, 0).UTC(),
+				VolumeName:   "verify-" + m.name,
+				Time:         time.Unix(1700000000, 0).UTC(),
+				PartitionMap: m.partitionMap,
 			}
 			if err := d.Create(src, out, m.mode); err != nil {
 				t.Fatalf("Create: %v", err)
@@ -127,7 +131,19 @@ func TestFsckHFS(t *testing.T) {
 // filesystem, and compares the names/sizes to the source folder. This
 // catches catalog/extent bugs that hdiutil verify would miss because it
 // only checks structural invariants, not actual file content.
+//
+// It runs both framings, because a GPT-framed image has to mount just
+// like a map-less one does.
 func TestMountAndCompare(t *testing.T) {
+	for _, partitionMap := range []bool{false, true} {
+		t.Run(fmt.Sprintf("PartitionMap=%v", partitionMap), func(t *testing.T) {
+			mountAndCompare(t, partitionMap)
+		})
+	}
+}
+
+func mountAndCompare(t *testing.T, partitionMap bool) {
+	t.Helper()
 	hdiutil, err := exec.LookPath("hdiutil")
 	if err != nil {
 		t.Skipf("hdiutil not in PATH: %v", err)
@@ -135,7 +151,7 @@ func TestMountAndCompare(t *testing.T) {
 
 	src := makeSourceTreeWithSymlink(t)
 	out := filepath.Join(t.TempDir(), "mount.dmg")
-	d := &DMG{VolumeName: "mounted", Time: time.Unix(1700000000, 0).UTC()}
+	d := &DMG{VolumeName: "mounted", Time: time.Unix(1700000000, 0).UTC(), PartitionMap: partitionMap}
 	if err := d.Create(src, out, ModeReadOnly); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -166,6 +182,66 @@ func TestMountAndCompare(t *testing.T) {
 	if srcWalk != mntWalk {
 		t.Errorf("mounted tree differs from source\n--- source ---\n%s\n--- mounted ---\n%s",
 			srcWalk, mntWalk)
+	}
+}
+
+// TestPartitionMapAttachAndFsck attaches a GPT-framed image without
+// mounting it. hdiutil has to read the partition map back and expose an
+// Apple_HFS slice, and fsck_hfs has to accept the volume inside it,
+// which is what a reader that parses the image instead of mounting it
+// does too.
+func TestPartitionMapAttachAndFsck(t *testing.T) {
+	hdiutil, err := exec.LookPath("hdiutil")
+	if err != nil {
+		t.Skipf("hdiutil not in PATH: %v", err)
+	}
+	fsck, err := exec.LookPath("fsck_hfs")
+	if err != nil {
+		t.Skipf("fsck_hfs not in PATH: %v", err)
+	}
+
+	src := makeSourceTreeWithSymlink(t)
+	out := filepath.Join(t.TempDir(), "gpt.dmg")
+	d := &DMG{VolumeName: "gpt-vol", Time: time.Unix(1700000000, 0).UTC(), PartitionMap: true}
+	if err := d.Create(src, out, ModeReadOnly); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	attach := exec.Command(hdiutil, "attach", "-nobrowse", "-nomount", "-readonly", out)
+	combined, err := attach.CombinedOutput()
+	if err != nil {
+		t.Fatalf("hdiutil attach -nomount failed: %v\n%s", err, combined)
+	}
+	// A framed image attaches the way a real disk does: the whole-disk
+	// node carries the GPT scheme, and the payload is a child slice
+	// typed Apple_HFS.
+	var hfsDev, rootDev string
+	for _, line := range strings.Split(string(combined), "\n") {
+		f := strings.Fields(line)
+		if len(f) == 0 || !strings.HasPrefix(f[0], "/dev/disk") {
+			continue
+		}
+		if rootDev == "" {
+			rootDev = f[0]
+		}
+		if len(f) >= 2 && strings.HasPrefix(f[1], "Apple_HFS") {
+			hfsDev = f[0]
+		}
+	}
+	defer func() {
+		if rootDev != "" {
+			_ = exec.Command(hdiutil, "detach", rootDev, "-force").Run()
+		}
+	}()
+	if !strings.Contains(string(combined), "GUID_partition_scheme") {
+		t.Errorf("hdiutil did not read a GUID partition scheme back:\n%s", combined)
+	}
+	if hfsDev == "" {
+		t.Fatalf("no Apple_HFS slice in hdiutil output:\n%s", combined)
+	}
+
+	if out2, err := exec.Command(fsck, "-fnd", hfsDev).CombinedOutput(); err != nil {
+		t.Fatalf("fsck_hfs on %s failed: %v\noutput:\n%s", hfsDev, err, out2)
 	}
 }
 
