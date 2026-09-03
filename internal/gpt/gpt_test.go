@@ -167,14 +167,14 @@ func TestGUIDsFollowTheSeeds(t *testing.T) {
 		{"a different timestamp", mustNew(t, 64*SectorSize, "Air", testTime.Add(time.Second)), false},
 		{"a different size", mustNew(t, 128*SectorSize, "Air", testTime), false},
 	} {
-		if got := c.layout.diskGUID() == base.diskGUID(); got != c.want {
+		if got := c.layout.diskGUID == base.diskGUID; got != c.want {
 			t.Errorf("disk GUID with %s: equal=%v want %v", c.label, got, c.want)
 		}
-		if got := c.layout.partitionGUID() == base.partitionGUID(); got != c.want {
+		if got := c.layout.partitionGUID == base.partitionGUID; got != c.want {
 			t.Errorf("partition GUID with %s: equal=%v want %v", c.label, got, c.want)
 		}
 	}
-	if base.diskGUID() == base.partitionGUID() {
+	if base.diskGUID == base.partitionGUID {
 		t.Errorf("the disk and the partition share one GUID; the tag does not separate them")
 	}
 }

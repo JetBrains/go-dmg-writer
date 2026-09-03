@@ -2,7 +2,9 @@ package dmg
 
 import (
 	"bytes"
+	"compress/zlib"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -294,26 +296,19 @@ func TestCreateDeterministicWithRootFinderInfo(t *testing.T) {
 
 // checkDMG performs format-level sanity checks on a produced DMG: KOLY
 // trailer is valid, sector count is sensible, and (for compressed images)
-// the data fork is smaller than the partition.
-func checkDMG(t *testing.T, path string, expectCompressed bool) {
+// the data fork is smaller than the partition. It returns the whole file
+// and its decoded trailer so a caller can go on to assert on the image
+// without opening and parsing it a second time.
+func checkDMG(t *testing.T, path string, expectCompressed bool) ([]byte, *udif.Koly) {
 	t.Helper()
-	f, err := os.Open(path)
+	raw, err := os.ReadFile(path)
 	if err != nil {
-		t.Fatalf("open: %v", err)
+		t.Fatalf("read %s: %v", path, err)
 	}
-	defer f.Close()
-	st, err := f.Stat()
-	if err != nil {
-		t.Fatal(err)
+	if len(raw) < udif.KolySize {
+		t.Fatalf("output too small: %d bytes", len(raw))
 	}
-	if st.Size() < udif.KolySize {
-		t.Fatalf("output too small: %d bytes", st.Size())
-	}
-	tail := make([]byte, udif.KolySize)
-	if _, err := f.ReadAt(tail, st.Size()-int64(udif.KolySize)); err != nil {
-		t.Fatalf("ReadAt: %v", err)
-	}
-	koly, err := udif.DecodeKoly(tail)
+	koly, err := udif.DecodeKoly(raw[len(raw)-udif.KolySize:])
 	if err != nil {
 		t.Fatalf("DecodeKoly: %v", err)
 	}
@@ -343,16 +338,156 @@ func checkDMG(t *testing.T, path string, expectCompressed bool) {
 
 	// The XML plist between the data fork and KOLY must look like a
 	// plist and reference a blkx entry.
-	xml := make([]byte, koly.XMLLength)
-	if _, err := f.ReadAt(xml, int64(koly.XMLOffset)); err != nil {
-		t.Fatalf("ReadAt xml: %v", err)
-	}
+	xml := imageXML(t, raw, koly)
 	if !bytes.Contains(xml, []byte("<key>resource-fork</key>")) {
 		t.Errorf("XML missing resource-fork key:\n%s", xml)
 	}
 	if !bytes.Contains(xml, []byte("<key>blkx</key>")) {
 		t.Errorf("XML missing blkx key")
 	}
+	return raw, koly
+}
+
+// imageXML is the resource-fork plist between the data fork and the KOLY.
+func imageXML(t *testing.T, raw []byte, koly *udif.Koly) []byte {
+	t.Helper()
+	end := koly.XMLOffset + koly.XMLLength
+	if end > uint64(len(raw)) {
+		t.Fatalf("XML at %d+%d runs past the %d-byte image", koly.XMLOffset, koly.XMLLength, len(raw))
+	}
+	return raw[koly.XMLOffset:end]
+}
+
+// blkxRun is the subset of a BLKX entry the tests assert on.
+type blkxRun struct {
+	runType     uint32
+	sectorStart uint64
+	sectorCount uint64
+	compOffset  uint64
+	compLength  uint64
+}
+
+// blkxTable pulls the blkx resource out of an image's XML plist and
+// decodes the mish table's chunk geometry. It returns
+// DecompressBufRequested (in sectors) and every run, terminator included.
+func blkxTable(t *testing.T, raw []byte, koly *udif.Koly) (uint32, []blkxRun) {
+	t.Helper()
+	xml := imageXML(t, raw, koly)
+
+	// The blkx array is the first resource in the fork, so its <data>
+	// block is the first one after the key.
+	key := bytes.Index(xml, []byte("<key>blkx</key>"))
+	if key < 0 {
+		t.Fatalf("no blkx key in the plist:\n%s", xml)
+	}
+	rest := xml[key:]
+	start := bytes.Index(rest, []byte("<data>"))
+	end := bytes.Index(rest, []byte("</data>"))
+	if start < 0 || end < start {
+		t.Fatalf("no <data> block after the blkx key:\n%s", rest)
+	}
+	b64 := strings.Join(strings.Fields(string(rest[start+len("<data>"):end])), "")
+	table, err := base64.StdEncoding.DecodeString(b64)
+	if err != nil {
+		t.Fatalf("decode blkx base64: %v", err)
+	}
+
+	// mish header: the 'mish' magic, then the fields at the offsets
+	// udif.BlkxTable.Encode writes. The run array follows the 204-byte
+	// header, 40 bytes per run.
+	const (
+		headerSize = 204
+		runSize    = 40
+	)
+	if len(table) < headerSize {
+		t.Fatalf("blkx too short: %d bytes", len(table))
+	}
+	if got := binary.BigEndian.Uint32(table[0:4]); got != udif.MishSignature {
+		t.Fatalf("blkx signature: got %#x want %#x", got, udif.MishSignature)
+	}
+	decompressBuf := binary.BigEndian.Uint32(table[32:36])
+	count := int(binary.BigEndian.Uint32(table[200:204]))
+	if want := headerSize + count*runSize; len(table) != want {
+		t.Fatalf("blkx is %d bytes, want %d for %d runs", len(table), want, count)
+	}
+	runs := make([]blkxRun, count)
+	for i := range runs {
+		r := table[headerSize+i*runSize:][:runSize]
+		runs[i] = blkxRun{
+			runType:     binary.BigEndian.Uint32(r[0:4]),
+			sectorStart: binary.BigEndian.Uint64(r[8:16]),
+			sectorCount: binary.BigEndian.Uint64(r[16:24]),
+			compOffset:  binary.BigEndian.Uint64(r[24:32]),
+			compLength:  binary.BigEndian.Uint64(r[32:40]),
+		}
+	}
+	if count == 0 || runs[count-1].runType != udif.BlockTerminator {
+		t.Fatalf("blkx does not end with a terminator run (%d runs)", count)
+	}
+	return decompressBuf, runs
+}
+
+// logicalDisk rebuilds what the image describes, sector for sector, by
+// replaying the BLKX table over the data fork: zero runs expand back to
+// zeros, raw runs are copied, zlib runs are inflated.
+//
+// Byte offsets in the file are NOT disk offsets. An all-zero chunk costs
+// no bytes in the data fork, and a compressed one costs fewer, so any
+// assertion about a particular sector has to be made against this buffer
+// rather than against the file.
+func logicalDisk(t *testing.T, raw []byte, koly *udif.Koly) []byte {
+	t.Helper()
+	_, runs := blkxTable(t, raw, koly)
+	forkEnd := koly.DataForkOffset + koly.DataForkLength
+	if forkEnd > uint64(len(raw)) {
+		t.Fatalf("data fork at %d+%d runs past the %d-byte image", koly.DataForkOffset, koly.DataForkLength, len(raw))
+	}
+	fork := raw[koly.DataForkOffset:forkEnd]
+
+	disk := make([]byte, koly.SectorCount*udif.SectorSize)
+	for i, r := range runs {
+		if r.runType == udif.BlockTerminator {
+			continue
+		}
+		at := r.sectorStart * udif.SectorSize
+		size := r.sectorCount * udif.SectorSize
+		if at+size > uint64(len(disk)) {
+			t.Fatalf("run %d covers sectors %d..%d, past the volume's %d", i, r.sectorStart, r.sectorStart+r.sectorCount, koly.SectorCount)
+		}
+		if r.compOffset+r.compLength > uint64(len(fork)) {
+			t.Fatalf("run %d reads %d+%d of a %d-byte data fork", i, r.compOffset, r.compLength, len(fork))
+		}
+		payload := fork[r.compOffset : r.compOffset+r.compLength]
+
+		switch r.runType {
+		case udif.BlockZero, udif.BlockZeroFill:
+			// The buffer is already zeroed; a zero run stores no bytes.
+		case udif.BlockRaw:
+			if uint64(len(payload)) != size {
+				t.Fatalf("raw run %d stores %d bytes for %d sectors", i, len(payload), r.sectorCount)
+			}
+			copy(disk[at:], payload)
+		case udif.BlockZLIB:
+			zr, err := zlib.NewReader(bytes.NewReader(payload))
+			if err != nil {
+				t.Fatalf("run %d: zlib reader: %v", i, err)
+			}
+			plain, err := io.ReadAll(zr)
+			if err != nil {
+				t.Fatalf("run %d: inflate: %v", i, err)
+			}
+			if err := zr.Close(); err != nil {
+				t.Fatalf("run %d: zlib close: %v", i, err)
+			}
+			if uint64(len(plain)) != size {
+				t.Fatalf("run %d inflates to %d bytes, want %d", i, len(plain), size)
+			}
+			copy(disk[at:], plain)
+		default:
+			t.Fatalf("run %d has unexpected type %#x", i, r.runType)
+		}
+	}
+	return disk
 }
 
 func sha256sum(t *testing.T, path string) [32]byte {
@@ -371,72 +506,83 @@ func sha256sum(t *testing.T, path string) [32]byte {
 	return out
 }
 
-// TestCreatePartitionMap checks the GPT framing end to end: the UDRO
-// data fork is the raw disk, so the protective MBR, the primary header
-// and the partition entry are readable straight out of the file, and
-// the volume has to land at the partition's first LBA.
+// TestCreatePartitionMap checks the GPT framing end to end: the
+// protective MBR, the primary header and the partition entry all decode,
+// and the volume lands at the partition's first LBA. Every offset is read
+// out of the replayed disk, not out of the file, so the assertions hold
+// for a compressed image too.
 func TestCreatePartitionMap(t *testing.T) {
 	src := makeSourceTree(t)
-	dir := t.TempDir()
-	bare, framed := filepath.Join(dir, "bare.dmg"), filepath.Join(dir, "framed.dmg")
-
 	when := time.Unix(1700000000, 0).UTC()
-	if err := (&DMG{VolumeName: "TEST", Time: when}).Create(src, bare, ModeReadOnly); err != nil {
-		t.Fatalf("Create without a map: %v", err)
-	}
-	if err := (&DMG{VolumeName: "TEST", Time: when, PartitionMap: true}).Create(src, framed, ModeReadOnly); err != nil {
-		t.Fatalf("Create with a map: %v", err)
-	}
-	checkDMG(t, framed /*compressed*/, false)
 
-	// The map is the only difference: the same volume, plus the leading
-	// and trailing sectors the framing costs.
-	bareSectors, framedSectors := readKoly(t, bare).SectorCount, readKoly(t, framed).SectorCount
-	if want := bareSectors + gpt.PartitionStartLBA + gpt.BackupSectors; framedSectors != want {
-		t.Errorf("framed sector count: got %d want %d (%d volume sectors plus the map)", framedSectors, want, bareSectors)
-	}
+	for _, mode := range []Mode{ModeReadOnly, ModeReadOnlyCompressed} {
+		t.Run(mode.String(), func(t *testing.T) {
+			dir := t.TempDir()
+			bare, framed := filepath.Join(dir, "bare.dmg"), filepath.Join(dir, "framed.dmg")
+			if err := (&DMG{VolumeName: "TEST", Time: when}).Create(src, bare, mode); err != nil {
+				t.Fatalf("Create without a map: %v", err)
+			}
+			if err := (&DMG{VolumeName: "TEST", Time: when, PartitionMap: true}).Create(src, framed, mode); err != nil {
+				t.Fatalf("Create with a map: %v", err)
+			}
+			compressed := mode == ModeReadOnlyCompressed
+			_, bareKoly := checkDMG(t, bare, compressed)
+			raw, koly := checkDMG(t, framed, compressed)
 
-	// The KOLY keeps saying "partition" even though the data fork is
-	// now a whole disk: hdiutil refuses an image whose variant is
-	// "device" unless the resource fork also splits the BLKX table
-	// per region, which this writer does not do. See the gpt package
-	// doc.
-	if got := readKoly(t, framed).ImageVariant; got != udif.ImageVariantPartition {
-		t.Errorf("framed ImageVariant: got %d want %d (partition)", got, udif.ImageVariantPartition)
-	}
+			// The map is the only difference: the same volume, plus the
+			// leading and trailing sectors the framing costs.
+			bareSectors, framedSectors := bareKoly.SectorCount, koly.SectorCount
+			if want := bareSectors + gpt.PartitionStartLBA + gpt.BackupSectors; framedSectors != want {
+				t.Errorf("framed sector count: got %d want %d (%d volume sectors plus the map)", framedSectors, want, bareSectors)
+			}
 
-	head := readAt(t, framed, 0, (gpt.PartitionStartLBA+2)*gpt.SectorSize)
-	if got := head[510:512]; !bytes.Equal(got, []byte{0x55, 0xAA}) {
-		t.Errorf("protective MBR signature: got %v want [85 170]", got)
-	}
-	if got := head[450]; got != 0xEE {
-		t.Errorf("MBR partition type: got %#x want 0xee, the GPT protective type", got)
-	}
-	if got := string(head[gpt.SectorSize : gpt.SectorSize+8]); got != "EFI PART" {
-		t.Errorf("primary GPT header: got %q want \"EFI PART\"", got)
-	}
+			// The KOLY keeps saying "partition" even though the data fork
+			// is now a whole disk: hdiutil refuses an image whose variant
+			// is "device" unless the resource fork also splits the BLKX
+			// table per region, which this writer does not do. See the
+			// gpt package doc.
+			if got := koly.ImageVariant; got != udif.ImageVariantPartition {
+				t.Errorf("framed ImageVariant: got %d want %d (partition)", got, udif.ImageVariantPartition)
+			}
 
-	entry := head[2*gpt.SectorSize:][:gpt.EntrySize]
-	if !bytes.Equal(entry[0:16], gpt.AppleHFSTypeGUID[:]) {
-		t.Errorf("partition type GUID: got %v want the Apple HFS GUID %v", entry[0:16], gpt.AppleHFSTypeGUID)
-	}
-	if got := binary.LittleEndian.Uint64(entry[32:40]); got != gpt.PartitionStartLBA {
-		t.Errorf("partition first LBA: got %d want %d", got, gpt.PartitionStartLBA)
-	}
-	if got, want := binary.LittleEndian.Uint64(entry[40:48]), gpt.PartitionStartLBA+bareSectors-1; got != want {
-		t.Errorf("partition last LBA: got %d want %d", got, want)
-	}
+			disk := logicalDisk(t, raw, koly)
+			if want := int(framedSectors) * gpt.SectorSize; len(disk) != want {
+				t.Fatalf("replayed disk is %d bytes, want %d", len(disk), want)
+			}
 
-	// The volume header sits 1024 bytes into the volume, which now sits
-	// at the partition's first LBA rather than at offset 0.
-	vh := readAt(t, framed, gpt.PartitionStartLBA*gpt.SectorSize+1024, 2)
-	if got := binary.BigEndian.Uint16(vh); got != hfsplus.VolumeSignature {
-		t.Errorf("HFSX signature at the partition start: got %#x want %#x", got, hfsplus.VolumeSignature)
-	}
-	// And the backup header closes the last sector of the disk.
-	last := readAt(t, framed, int64(framedSectors-1)*gpt.SectorSize, 8)
-	if got := string(last); got != "EFI PART" {
-		t.Errorf("backup GPT header in the last sector: got %q want \"EFI PART\"", got)
+			if got := disk[510:512]; !bytes.Equal(got, []byte{0x55, 0xAA}) {
+				t.Errorf("protective MBR signature: got %v want [85 170]", got)
+			}
+			if got := disk[450]; got != 0xEE {
+				t.Errorf("MBR partition type: got %#x want 0xee, the GPT protective type", got)
+			}
+			if got := string(disk[gpt.SectorSize : gpt.SectorSize+8]); got != "EFI PART" {
+				t.Errorf("primary GPT header: got %q want \"EFI PART\"", got)
+			}
+
+			entry := disk[gpt.EntryArrayLBA*gpt.SectorSize:][:gpt.EntrySize]
+			if !bytes.Equal(entry[0:16], gpt.AppleHFSTypeGUID[:]) {
+				t.Errorf("partition type GUID: got %v want the Apple HFS GUID %v", entry[0:16], gpt.AppleHFSTypeGUID)
+			}
+			if got := binary.LittleEndian.Uint64(entry[32:40]); got != gpt.PartitionStartLBA {
+				t.Errorf("partition first LBA: got %d want %d", got, gpt.PartitionStartLBA)
+			}
+			if got, want := binary.LittleEndian.Uint64(entry[40:48]), gpt.PartitionStartLBA+bareSectors-1; got != want {
+				t.Errorf("partition last LBA: got %d want %d", got, want)
+			}
+
+			// The volume header sits 1024 bytes into the volume, which now
+			// sits at the partition's first LBA rather than at offset 0.
+			vh := disk[gpt.PartitionStartLBA*gpt.SectorSize+1024:]
+			if got := binary.BigEndian.Uint16(vh[0:2]); got != hfsplus.VolumeSignature {
+				t.Errorf("HFSX signature at the partition start: got %#x want %#x", got, hfsplus.VolumeSignature)
+			}
+			// And the backup header closes the last sector of the disk.
+			last := disk[(framedSectors-1)*gpt.SectorSize:][:8]
+			if got := string(last); got != "EFI PART" {
+				t.Errorf("backup GPT header in the last sector: got %q want \"EFI PART\"", got)
+			}
+		})
 	}
 }
 
@@ -461,31 +607,103 @@ func TestCreatePartitionMapDeterministic(t *testing.T) {
 	}
 }
 
-// readKoly decodes the trailing KOLY block of a finished image.
-func readKoly(t *testing.T, path string) *udif.Koly {
-	t.Helper()
-	st, err := os.Stat(path)
-	if err != nil {
-		t.Fatal(err)
+// TestCreateEmptySourcePartitionMapNonEmptyVolume pins the interaction
+// between the two "nothing to write" paths: an empty source folder still
+// produces a real HFS+ volume (the B-trees and the allocation file exist
+// even with no user content), so the GPT framing must describe a
+// non-empty partition rather than a zero-length one.
+func TestCreateEmptySourcePartitionMapNonEmptyVolume(t *testing.T) {
+	src := t.TempDir() // no files at all
+	out := filepath.Join(t.TempDir(), "empty-gpt.dmg")
+	d := &DMG{VolumeName: "empty", Time: time.Unix(1700000000, 0).UTC(), PartitionMap: true}
+	if err := d.Create(src, out, ModeReadOnly); err != nil {
+		t.Fatalf("Create: %v", err)
 	}
-	koly, err := udif.DecodeKoly(readAt(t, path, st.Size()-int64(udif.KolySize), udif.KolySize))
-	if err != nil {
-		t.Fatalf("DecodeKoly: %v", err)
+	raw, koly := checkDMG(t, out /*compressed*/, false)
+
+	// Whatever is left after the leading and trailing map sectors is the
+	// volume, and there has to be some of it.
+	volumeSectors := int64(koly.SectorCount) - gpt.PartitionStartLBA - gpt.BackupSectors
+	if volumeSectors <= 0 {
+		t.Fatalf("volume sectors: got %d, want a non-empty volume (total %d sectors)", volumeSectors, koly.SectorCount)
 	}
-	return koly
+
+	disk := logicalDisk(t, raw, koly)
+
+	// The partition entry has to cover exactly those sectors.
+	entry := disk[gpt.EntryArrayLBA*gpt.SectorSize:][:gpt.EntrySize]
+	first := binary.LittleEndian.Uint64(entry[32:40])
+	last := binary.LittleEndian.Uint64(entry[40:48])
+	if first != gpt.PartitionStartLBA {
+		t.Errorf("partition first LBA: got %d want %d", first, gpt.PartitionStartLBA)
+	}
+	if want := uint64(volumeSectors); last-first+1 != want {
+		t.Errorf("partition covers %d sectors, want %d", last-first+1, want)
+	}
+
+	// And the volume itself is a formatted HFSX volume with allocation
+	// blocks, not a hole full of zeros.
+	vh := disk[gpt.PartitionStartLBA*gpt.SectorSize+1024:]
+	if got := binary.BigEndian.Uint16(vh[0:2]); got != hfsplus.VolumeSignature {
+		t.Fatalf("HFSX signature at the partition start: got %#x want %#x", got, hfsplus.VolumeSignature)
+	}
+	blockSize := binary.BigEndian.Uint32(vh[40:44])
+	totalBlocks := binary.BigEndian.Uint32(vh[44:48])
+	if blockSize == 0 || totalBlocks == 0 {
+		t.Fatalf("empty volume header: blockSize=%d totalBlocks=%d", blockSize, totalBlocks)
+	}
+	if got, want := uint64(blockSize)*uint64(totalBlocks), uint64(volumeSectors)*gpt.SectorSize; got != want {
+		t.Errorf("volume describes %d bytes, but the partition holds %d", got, want)
+	}
 }
 
-// readAt reads n bytes from off, and fails the test if it cannot.
-func readAt(t *testing.T, path string, off int64, n int) []byte {
-	t.Helper()
-	f, err := os.Open(path)
-	if err != nil {
-		t.Fatal(err)
+// TestCreateChunkSectors checks that [DMG.ChunkSectors] actually reaches
+// [udif.Options]: the udif tests cover the option itself, but nothing
+// covered the wiring from Create, so dropping the field assignment in
+// dmg.go would have gone unnoticed.
+func TestCreateChunkSectors(t *testing.T) {
+	src := t.TempDir()
+	// A payload big enough to span many chunks at the small chunk size.
+	body := make([]byte, 512*1024)
+	for i := range body {
+		body[i] = byte(i ^ (i >> 11))
 	}
-	defer f.Close()
-	buf := make([]byte, n)
-	if _, err := f.ReadAt(buf, off); err != nil {
-		t.Fatalf("ReadAt(%s, %d, %d): %v", path, off, n, err)
+	mustWrite(t, filepath.Join(src, "payload.bin"), string(body))
+
+	const chunkSectors = 8 // 4 KiB, far below the 2048-sector default
+	out := filepath.Join(t.TempDir(), "chunked.dmg")
+	d := &DMG{
+		VolumeName:   "chunked",
+		Time:         time.Unix(1700000000, 0).UTC(),
+		ChunkSectors: chunkSectors,
 	}
-	return buf
+	if err := d.Create(src, out, ModeReadOnly); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	raw, koly := checkDMG(t, out /*compressed*/, false)
+
+	decompressBuf, runs := blkxTable(t, raw, koly)
+	if decompressBuf != chunkSectors {
+		t.Errorf("blkx DecompressBufRequested: got %d want %d sectors", decompressBuf, chunkSectors)
+	}
+
+	// Every run but the terminator is at most one chunk long, and the
+	// runs tile the volume without a gap.
+	var covered uint64
+	for i, r := range runs {
+		if r.sectorStart != covered {
+			t.Fatalf("run %d starts at sector %d, want %d", i, r.sectorStart, covered)
+		}
+		if r.sectorCount > chunkSectors {
+			t.Errorf("run %d spans %d sectors, more than the %d-sector chunk", i, r.sectorCount, chunkSectors)
+		}
+		covered += r.sectorCount
+	}
+	if covered != koly.SectorCount {
+		t.Errorf("runs cover %d sectors, want the volume's %d", covered, koly.SectorCount)
+	}
+	// ceil(SectorCount / chunkSectors) data runs, plus the terminator.
+	if want := int((koly.SectorCount+chunkSectors-1)/chunkSectors) + 1; len(runs) != want {
+		t.Errorf("run count: got %d want %d (%d sectors in %d-sector chunks)", len(runs), want, koly.SectorCount, chunkSectors)
+	}
 }

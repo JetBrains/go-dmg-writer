@@ -187,7 +187,7 @@ func mountAndCompare(t *testing.T, partitionMap bool) {
 
 // TestPartitionMapAttachAndFsck attaches a GPT-framed image without
 // mounting it. hdiutil has to read the partition map back and expose an
-// Apple_HFS slice, and fsck_hfs has to accept the volume inside it —
+// Apple_HFS slice, and fsck_hfs has to accept the volume inside it,
 // which is what a reader that parses the image instead of mounting it
 // does too.
 func TestPartitionMapAttachAndFsck(t *testing.T) {

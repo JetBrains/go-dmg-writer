@@ -222,6 +222,18 @@ func (d *DMG) Create(srcFolder, outPath string, mode Mode) (err error) {
 		return err
 	}
 
+	// The partition map goes between the volume and the UDIF wrapper.
+	// Derive it before the output file exists, so a volume size the map
+	// cannot describe leaves no truncated file behind (and does not
+	// clobber a good image from a previous run).
+	var layout gpt.Layout
+	if d.PartitionMap {
+		layout, err = gpt.New(volumeSize, volName, when)
+		if err != nil {
+			return fmt.Errorf("dmg: partition map: %w", err)
+		}
+	}
+
 	out, err := os.Create(outPath)
 	if err != nil {
 		return fmt.Errorf("dmg: open output: %w", err)
@@ -246,18 +258,18 @@ func (d *DMG) Create(srcFolder, outPath string, mode Mode) (err error) {
 		Time:         when,
 	}
 
-	// The partition map goes between the volume and the UDIF
-	// wrapper. udif.Write takes an io.Reader, so the two halves of
-	// the map stream in front of and behind the scratch file. There
-	// is no second pass and no second scratch file.
-	var src io.Reader = scratch
+	// udif.Write takes an io.Reader, so the two halves of the map stream
+	// in front of and behind the scratch file. There is no second pass
+	// and no second scratch file.
+	//
+	// The scratch reader is capped at volumeSize: the geometry the map
+	// describes is authoritative, and io.MultiReader would otherwise read
+	// the file to EOF, so a scratch file longer than the volume it
+	// reports would push the trailing map off its sector.
+	var src io.Reader = io.LimitReader(scratch, int64(volumeSize))
 	srcLen := int64(volumeSize)
 	if d.PartitionMap {
-		layout, err := gpt.New(volumeSize, volName, when)
-		if err != nil {
-			return fmt.Errorf("dmg: partition map: %w", err)
-		}
-		src = io.MultiReader(bytes.NewReader(layout.LeadingMap()), scratch, bytes.NewReader(layout.TrailingMap()))
+		src = io.MultiReader(bytes.NewReader(layout.LeadingMap()), src, bytes.NewReader(layout.TrailingMap()))
 		srcLen = int64(layout.DiskSize())
 	}
 
