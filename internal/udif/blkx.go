@@ -9,14 +9,16 @@ const MishSignature uint32 = 0x6D697368
 
 // Block run types recognized by macOS for entries in a BLKX table.
 //
-// Note on zero chunks: hdiutil itself emits run type 0x00000002 ("ignore"
-// or "free") for chunks that are entirely zero, with CompLength=0. macOS
-// accepts run type 0x00000000 as a synonym, but we use 0x00000002 to
-// match what hdiutil produces and what every public UDIF tool understands.
+// Note on zero runs: 0x00000000 and 0x00000002 are NOT synonyms, and the
+// difference decides the checksum. hdiutil emits both, and it feeds the
+// sectors of a 0x00000000 run into the table's CRC-32 as zeros while it
+// skips the sectors of a 0x00000002 run entirely. A writer that emits
+// 0x00000002 and then counts those sectors produces a checksum hdiutil
+// rejects. [BlkxTable.Checksum] says which sectors a table's CRC covers.
 const (
-	BlockZeroFill   uint32 = 0x00000000 // alternative zero-fill encoding
+	BlockZeroFill   uint32 = 0x00000000 // all-zero, CompLength=0, counted in the CRC
 	BlockRaw        uint32 = 0x00000001 // chunk is stored verbatim
-	BlockZero       uint32 = 0x00000002 // sparse/free: chunk is all-zero, CompLength=0
+	BlockZero       uint32 = 0x00000002 // free/ignore, CompLength=0, NOT counted in the CRC
 	BlockADC        uint32 = 0x80000004 // Apple Data Compression (not used)
 	BlockZLIB       uint32 = 0x80000005 // zlib-compressed chunk
 	BlockBZIP2      uint32 = 0x80000006 // bzip2-compressed (not used)
@@ -63,7 +65,10 @@ type BlkxTable struct {
 	BlocksDescriptor       uint32 // partition number (or ENTIRE_DEVICE)
 	Reserved               [6]uint32
 
-	Checksum UDIFChecksum // CRC32 of the *uncompressed* sectors in this run
+	// Checksum is the CRC-32 of this table's *uncompressed* sectors, in
+	// sector order, with the sectors of every [BlockZero] run left out.
+	// See the note on the run types for why those sectors do not count.
+	Checksum UDIFChecksum
 
 	Runs []BlockRun
 }

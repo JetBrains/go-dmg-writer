@@ -166,3 +166,101 @@ func TestZlibRoundTrip(t *testing.T) {
 		t.Fatalf("zlib round-trip mismatch")
 	}
 }
+
+func TestBlkxSpecsMapLess(t *testing.T) {
+	specs, variant, err := blkxSpecs(nil, "vol", 100)
+	if err != nil {
+		t.Fatalf("blkxSpecs: %v", err)
+	}
+	if len(specs) != 1 {
+		t.Fatalf("got %d specs, want 1 for a map-less image", len(specs))
+	}
+	if variant != ImageVariantPartition {
+		t.Errorf("ImageVariant: got %d want %d (partition)", variant, ImageVariantPartition)
+	}
+	want := blkxSpec{name: "vol (Apple_HFSX : 1)", id: 0, descriptor: partitionVariantNumber, sectors: 100}
+	if specs[0] != want {
+		t.Errorf("spec: got %+v want %+v", specs[0], want)
+	}
+}
+
+func TestBlkxSpecsRegions(t *testing.T) {
+	regions := []Region{
+		{Name: "Protective Master Boot Record", Type: "MBR", SectorCount: 1},
+		{Name: "", Type: "Apple_Free", SectorCount: 6},
+		{Name: "disk image", Type: "Apple_HFS", SectorCount: 93},
+	}
+	specs, variant, err := blkxSpecs(regions, "vol", 100)
+	if err != nil {
+		t.Fatalf("blkxSpecs: %v", err)
+	}
+	if variant != ImageVariantDevice {
+		t.Errorf("ImageVariant: got %d want %d (device)", variant, ImageVariantDevice)
+	}
+	// The name carries the region index, the ID counts from -1, and
+	// each region starts where the one in front of it ends.
+	want := []blkxSpec{
+		{name: "Protective Master Boot Record (MBR : 0)", id: -1, descriptor: 0, firstSector: 0, sectors: 1},
+		{name: " (Apple_Free : 1)", id: 0, descriptor: 1, firstSector: 1, sectors: 6},
+		{name: "disk image (Apple_HFS : 2)", id: 1, descriptor: 2, firstSector: 7, sectors: 93},
+	}
+	if len(specs) != len(want) {
+		t.Fatalf("got %d specs, want %d", len(specs), len(want))
+	}
+	for i := range want {
+		if specs[i] != want[i] {
+			t.Errorf("spec %d: got %+v want %+v", i, specs[i], want[i])
+		}
+	}
+}
+
+// TestBlkxSpecsRejectsBadRegions covers the two ways a caller can hand
+// over a region list that does not describe the image it is writing.
+// Both have to fail before any bytes reach the output.
+func TestBlkxSpecsRejectsBadRegions(t *testing.T) {
+	tests := []struct {
+		name    string
+		regions []Region
+		total   uint64
+	}{
+		{
+			name:    "empty region",
+			regions: []Region{{Type: "MBR", SectorCount: 1}, {Type: "Apple_Free", SectorCount: 0}},
+			total:   1,
+		},
+		{
+			name:    "regions shorter than the image",
+			regions: []Region{{Type: "MBR", SectorCount: 1}},
+			total:   100,
+		},
+		{
+			name:    "regions longer than the image",
+			regions: []Region{{Type: "MBR", SectorCount: 1}, {Type: "Apple_HFS", SectorCount: 200}},
+			total:   100,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, _, err := blkxSpecs(tt.regions, "vol", tt.total); err == nil {
+				t.Error("blkxSpecs accepted a region list it should reject")
+			}
+		})
+	}
+}
+
+// TestWriteRejectsBadRegions is the same check one level up: Write must
+// refuse the image rather than write a resource fork that disagrees with
+// the data fork.
+func TestWriteRejectsBadRegions(t *testing.T) {
+	const size = 4 * SectorSize
+	var out bytes.Buffer
+	err := Write(&out, newFakeSrc(size), size, Options{
+		VolumeName:   "test",
+		Compression:  CompressionNone,
+		ChunkSectors: 4,
+		Regions:      []Region{{Name: "", Type: "Apple_HFS", SectorCount: 3}},
+	})
+	if err == nil {
+		t.Fatal("Write accepted regions that cover 3 of 4 sectors")
+	}
+}

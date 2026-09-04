@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"os"
 	"path/filepath"
@@ -102,6 +103,60 @@ func TestCreateLargeFile(t *testing.T) {
 		t.Fatalf("Create: %v", err)
 	}
 	checkDMG(t, out, true)
+}
+
+// TestCreateZeroFileChecksum guards the run type a checksum must skip.
+// A file of zeros gives whole chunks of zeros, and every one of them
+// becomes a BlockZero run that stores no bytes. Those sectors must stay
+// out of the table CRC. A writer that counts them writes a checksum
+// macOS rejects, and `hdiutil verify` is then the only thing that
+// notices, because the image still replays sector for sector.
+func TestCreateZeroFileChecksum(t *testing.T) {
+	src := t.TempDir()
+	// Several chunks of zeros, so the run coalesces rather than
+	// depending on where one chunk ends.
+	mustWrite(t, filepath.Join(src, "hole.bin"), string(make([]byte, 6*1024*1024)))
+	mustWrite(t, filepath.Join(src, "alpha.txt"), "alpha contents\n")
+
+	for _, mode := range []Mode{ModeReadOnly, ModeReadOnlyCompressed} {
+		for _, withMap := range []bool{false, true} {
+			name := mode.String()
+			if withMap {
+				name += "/PartitionMap"
+			}
+			t.Run(name, func(t *testing.T) {
+				out := filepath.Join(t.TempDir(), "zero.dmg")
+				d := &DMG{VolumeName: "TEST", Time: time.Unix(1700000000, 0).UTC(), PartitionMap: withMap}
+				if err := d.Create(src, out, mode); err != nil {
+					t.Fatalf("Create: %v", err)
+				}
+				// checkDMG holds every checksum against the sectors it
+				// covers; this test only has to prove the skipped run
+				// type is really in the image.
+				raw, koly := checkDMG(t, out, mode == ModeReadOnlyCompressed)
+
+				var zeroRuns, zeroSectors uint64
+				for _, reg := range blkxRegions(t, raw, koly) {
+					for _, r := range reg.runs {
+						if r.runType == udif.BlockZero {
+							zeroRuns++
+							zeroSectors += r.sectorCount
+						}
+					}
+				}
+				if zeroRuns == 0 {
+					t.Fatal("no BlockZero run in the image, so this test proves nothing")
+				}
+				// The file holds 12288 sectors of zeros. The chunk at
+				// each end of it also holds volume data, so it stays a
+				// raw or a zlib run; every chunk between them is a zero
+				// run. The default chunk is 2048 sectors.
+				if want := uint64(6*1024*1024/udif.SectorSize) - 2*2048; zeroSectors < want {
+					t.Errorf("%d BlockZero runs cover %d sectors, want at least %d", zeroRuns, zeroSectors, want)
+				}
+			})
+		}
+	}
 }
 
 func TestCreateSymlink(t *testing.T) {
@@ -266,7 +321,7 @@ func TestCreateRootFinderInfoBadSize(t *testing.T) {
 
 // TestCreateDeterministicWithRootFinderInfo verifies determinism is
 // preserved when an extra xattr (the RootFinderInfo) is injected. The
-// attributes B-tree's record ordering is stable and shouldn't drift
+// attributes B-tree's record ordering are stable and shouldn't drift
 // across runs.
 func TestCreateDeterministicWithRootFinderInfo(t *testing.T) {
 	src := makeSourceTree(t)
@@ -345,7 +400,53 @@ func checkDMG(t *testing.T, path string, expectCompressed bool) ([]byte, *udif.K
 	if !bytes.Contains(xml, []byte("<key>blkx</key>")) {
 		t.Errorf("XML missing blkx key")
 	}
+
+	checkChecksums(t, raw, koly)
 	return raw, koly
+}
+
+// checkChecksums recomputes every checksum the image carries and holds it
+// against the stored value. hdiutil makes this same check when it
+// verifies an image, and it is the one check the rest of the suite cannot
+// stand in for: an image whose sectors all replay correctly is still
+// broken, and macOS still rejects it, if a checksum counts the wrong
+// sectors.
+func checkChecksums(t *testing.T, raw []byte, koly *udif.Koly) {
+	t.Helper()
+	regions := blkxRegions(t, raw, koly)
+	forkEnd := koly.DataForkOffset + koly.DataForkLength
+	if forkEnd > uint64(len(raw)) {
+		t.Fatalf("data fork at %d+%d runs past the %d-byte image", koly.DataForkOffset, koly.DataForkLength, len(raw))
+	}
+	fork := raw[koly.DataForkOffset:forkEnd]
+
+	perTable := make([]uint32, 0, len(regions))
+	forkCRC := crc32.NewIEEE()
+	for _, reg := range regions {
+		tableCRC := crc32.NewIEEE()
+		for i, r := range reg.runs {
+			// A BlockZero run marks free space that a reader must not
+			// touch, so its sectors stay out of the CRC. The sectors
+			// of a BlockZeroFill run go in as zeros. The two run
+			// types look alike on the disk and differ only here.
+			if r.runType == udif.BlockTerminator || r.runType == udif.BlockZero {
+				continue
+			}
+			_, _ = io.MultiWriter(tableCRC, forkCRC).Write(runBytes(t, fork, reg, i, r))
+		}
+		if got, want := reg.checksum, tableCRC.Sum32(); got != want {
+			t.Errorf("blkx %q checksum: the table says %#08x, its own sectors give %#08x", reg.name, got, want)
+		}
+		perTable = append(perTable, reg.checksum)
+	}
+	if got, want := koly.MasterChecksum.Data[0], udif.MasterChecksum(perTable); got != want {
+		t.Errorf("MasterChecksum over the %d table checksums: got %#08x want %#08x", len(perTable), got, want)
+	}
+	// The data fork checksum covers the same sectors as the tables, end
+	// to end, in one pass over the whole image.
+	if got, want := koly.DataForkChecksum.Data[0], forkCRC.Sum32(); got != want {
+		t.Errorf("DataForkChecksum: the trailer says %#08x, the sectors give %#08x", got, want)
+	}
 }
 
 // imageXML is the resource-fork plist between the data fork and the KOLY.
@@ -367,29 +468,32 @@ type blkxRun struct {
 	compLength  uint64
 }
 
-// blkxTable pulls the blkx resource out of an image's XML plist and
-// decodes the mish table's chunk geometry. It returns
-// DecompressBufRequested (in sectors) and every run, terminator included.
-func blkxTable(t *testing.T, raw []byte, koly *udif.Koly) (uint32, []blkxRun) {
+// blkxRegion is one decoded blkx resource. A map-less image has exactly
+// one; a framed image has one per region of its partition map.
+type blkxRegion struct {
+	name          string
+	firstSector   uint64
+	sectorCount   uint64
+	descriptor    uint32
+	checksum      uint32
+	decompressBuf uint32
+	runs          []blkxRun
+}
+
+// blkxRegions pulls every blkx resource out of an image's XML plist and
+// decodes each mish table. SectorStart inside a run counts from the
+// region's own first sector, not from the start of the disk.
+func blkxRegions(t *testing.T, raw []byte, koly *udif.Koly) []blkxRegion {
 	t.Helper()
 	xml := imageXML(t, raw, koly)
 
-	// The blkx array is the first resource in the fork, so its <data>
-	// block is the first one after the key.
 	key := bytes.Index(xml, []byte("<key>blkx</key>"))
 	if key < 0 {
 		t.Fatalf("no blkx key in the plist:\n%s", xml)
 	}
 	rest := xml[key:]
-	start := bytes.Index(rest, []byte("<data>"))
-	end := bytes.Index(rest, []byte("</data>"))
-	if start < 0 || end < start {
-		t.Fatalf("no <data> block after the blkx key:\n%s", rest)
-	}
-	b64 := strings.Join(strings.Fields(string(rest[start+len("<data>"):end])), "")
-	table, err := base64.StdEncoding.DecodeString(b64)
-	if err != nil {
-		t.Fatalf("decode blkx base64: %v", err)
+	if end := bytes.Index(rest, []byte("</array>")); end >= 0 {
+		rest = rest[:end]
 	}
 
 	// mish header: the 'mish' magic, then the fields at the offsets
@@ -399,32 +503,80 @@ func blkxTable(t *testing.T, raw []byte, koly *udif.Koly) (uint32, []blkxRun) {
 		headerSize = 204
 		runSize    = 40
 	)
-	if len(table) < headerSize {
-		t.Fatalf("blkx too short: %d bytes", len(table))
-	}
-	if got := binary.BigEndian.Uint32(table[0:4]); got != udif.MishSignature {
-		t.Fatalf("blkx signature: got %#x want %#x", got, udif.MishSignature)
-	}
-	decompressBuf := binary.BigEndian.Uint32(table[32:36])
-	count := int(binary.BigEndian.Uint32(table[200:204]))
-	if want := headerSize + count*runSize; len(table) != want {
-		t.Fatalf("blkx is %d bytes, want %d for %d runs", len(table), want, count)
-	}
-	runs := make([]blkxRun, count)
-	for i := range runs {
-		r := table[headerSize+i*runSize:][:runSize]
-		runs[i] = blkxRun{
-			runType:     binary.BigEndian.Uint32(r[0:4]),
-			sectorStart: binary.BigEndian.Uint64(r[8:16]),
-			sectorCount: binary.BigEndian.Uint64(r[16:24]),
-			compOffset:  binary.BigEndian.Uint64(r[24:32]),
-			compLength:  binary.BigEndian.Uint64(r[32:40]),
+	var out []blkxRegion
+	for {
+		start := bytes.Index(rest, []byte("<data>"))
+		if start < 0 {
+			break
 		}
+		end := bytes.Index(rest, []byte("</data>"))
+		if end < start {
+			t.Fatalf("unterminated <data> block in the plist:\n%s", rest)
+		}
+
+		// CFName is the last <string> in front of the payload.
+		name := ""
+		if open := bytes.LastIndex(rest[:start], []byte("<string>")); open >= 0 {
+			if shut := bytes.Index(rest[open:start], []byte("</string>")); shut > 0 {
+				name = string(rest[open+len("<string>") : open+shut])
+			}
+		}
+
+		b64 := strings.Join(strings.Fields(string(rest[start+len("<data>"):end])), "")
+		table, err := base64.StdEncoding.DecodeString(b64)
+		if err != nil {
+			t.Fatalf("decode blkx base64 for %q: %v", name, err)
+		}
+		if len(table) < headerSize {
+			t.Fatalf("blkx %q too short: %d bytes", name, len(table))
+		}
+		if got := binary.BigEndian.Uint32(table[0:4]); got != udif.MishSignature {
+			t.Fatalf("blkx %q signature: got %#x want %#x", name, got, udif.MishSignature)
+		}
+		count := int(binary.BigEndian.Uint32(table[200:204]))
+		if want := headerSize + count*runSize; len(table) != want {
+			t.Fatalf("blkx %q is %d bytes, want %d for %d runs", name, len(table), want, count)
+		}
+		runs := make([]blkxRun, count)
+		for i := range runs {
+			r := table[headerSize+i*runSize:][:runSize]
+			runs[i] = blkxRun{
+				runType:     binary.BigEndian.Uint32(r[0:4]),
+				sectorStart: binary.BigEndian.Uint64(r[8:16]),
+				sectorCount: binary.BigEndian.Uint64(r[16:24]),
+				compOffset:  binary.BigEndian.Uint64(r[24:32]),
+				compLength:  binary.BigEndian.Uint64(r[32:40]),
+			}
+		}
+		if count == 0 || runs[count-1].runType != udif.BlockTerminator {
+			t.Fatalf("blkx %q does not end with a terminator run (%d runs)", name, count)
+		}
+		out = append(out, blkxRegion{
+			name:          name,
+			firstSector:   binary.BigEndian.Uint64(table[8:16]),
+			sectorCount:   binary.BigEndian.Uint64(table[16:24]),
+			descriptor:    binary.BigEndian.Uint32(table[36:40]),
+			checksum:      binary.BigEndian.Uint32(table[72:76]),
+			decompressBuf: binary.BigEndian.Uint32(table[32:36]),
+			runs:          runs,
+		})
+		rest = rest[end+len("</data>"):]
 	}
-	if count == 0 || runs[count-1].runType != udif.BlockTerminator {
-		t.Fatalf("blkx does not end with a terminator run (%d runs)", count)
+	if len(out) == 0 {
+		t.Fatalf("no blkx resource in the plist:\n%s", xml)
 	}
-	return decompressBuf, runs
+	return out
+}
+
+// blkxTable returns the single table of a map-less image: its
+// DecompressBufRequested (in sectors) and every run, terminator included.
+func blkxTable(t *testing.T, raw []byte, koly *udif.Koly) (uint32, []blkxRun) {
+	t.Helper()
+	regions := blkxRegions(t, raw, koly)
+	if len(regions) != 1 {
+		t.Fatalf("expected a single blkx table, got %d", len(regions))
+	}
+	return regions[0].decompressBuf, regions[0].runs
 }
 
 // logicalDisk rebuilds what the image describes, sector for sector, by
@@ -437,7 +589,7 @@ func blkxTable(t *testing.T, raw []byte, koly *udif.Koly) (uint32, []blkxRun) {
 // rather than against the file.
 func logicalDisk(t *testing.T, raw []byte, koly *udif.Koly) []byte {
 	t.Helper()
-	_, runs := blkxTable(t, raw, koly)
+	regions := blkxRegions(t, raw, koly)
 	forkEnd := koly.DataForkOffset + koly.DataForkLength
 	if forkEnd > uint64(len(raw)) {
 		t.Fatalf("data fork at %d+%d runs past the %d-byte image", koly.DataForkOffset, koly.DataForkLength, len(raw))
@@ -445,49 +597,66 @@ func logicalDisk(t *testing.T, raw []byte, koly *udif.Koly) []byte {
 	fork := raw[koly.DataForkOffset:forkEnd]
 
 	disk := make([]byte, koly.SectorCount*udif.SectorSize)
-	for i, r := range runs {
-		if r.runType == udif.BlockTerminator {
-			continue
-		}
-		at := r.sectorStart * udif.SectorSize
-		size := r.sectorCount * udif.SectorSize
-		if at+size > uint64(len(disk)) {
-			t.Fatalf("run %d covers sectors %d..%d, past the volume's %d", i, r.sectorStart, r.sectorStart+r.sectorCount, koly.SectorCount)
-		}
-		if r.compOffset+r.compLength > uint64(len(fork)) {
-			t.Fatalf("run %d reads %d+%d of a %d-byte data fork", i, r.compOffset, r.compLength, len(fork))
-		}
-		payload := fork[r.compOffset : r.compOffset+r.compLength]
-
-		switch r.runType {
-		case udif.BlockZero, udif.BlockZeroFill:
-			// The buffer is already zeroed; a zero run stores no bytes.
-		case udif.BlockRaw:
-			if uint64(len(payload)) != size {
-				t.Fatalf("raw run %d stores %d bytes for %d sectors", i, len(payload), r.sectorCount)
+	for _, reg := range regions {
+		for i, r := range reg.runs {
+			if r.runType == udif.BlockTerminator {
+				continue
 			}
-			copy(disk[at:], payload)
-		case udif.BlockZLIB:
-			zr, err := zlib.NewReader(bytes.NewReader(payload))
-			if err != nil {
-				t.Fatalf("run %d: zlib reader: %v", i, err)
+			// A run addresses its own region; the region says where
+			// that sits on the disk.
+			at := (reg.firstSector + r.sectorStart) * udif.SectorSize
+			if at+r.sectorCount*udif.SectorSize > uint64(len(disk)) {
+				t.Fatalf("%q run %d covers sectors %d..%d, past the disk's %d",
+					reg.name, i, reg.firstSector+r.sectorStart, reg.firstSector+r.sectorStart+r.sectorCount, koly.SectorCount)
 			}
-			plain, err := io.ReadAll(zr)
-			if err != nil {
-				t.Fatalf("run %d: inflate: %v", i, err)
-			}
-			if err := zr.Close(); err != nil {
-				t.Fatalf("run %d: zlib close: %v", i, err)
-			}
-			if uint64(len(plain)) != size {
-				t.Fatalf("run %d inflates to %d bytes, want %d", i, len(plain), size)
-			}
-			copy(disk[at:], plain)
-		default:
-			t.Fatalf("run %d has unexpected type %#x", i, r.runType)
+			copy(disk[at:], runBytes(t, fork, reg, i, r))
 		}
 	}
 	return disk
+}
+
+// runBytes expands one run to the sectors it stands for: a zero run to
+// zeros, a raw run to its bytes in the data fork, a zlib run to what
+// those bytes inflate to. The terminator run has no sectors.
+func runBytes(t *testing.T, fork []byte, reg blkxRegion, i int, r blkxRun) []byte {
+	t.Helper()
+	if r.compOffset+r.compLength > uint64(len(fork)) {
+		t.Fatalf("%q run %d reads %d+%d of a %d-byte data fork", reg.name, i, r.compOffset, r.compLength, len(fork))
+	}
+	payload := fork[r.compOffset : r.compOffset+r.compLength]
+	size := r.sectorCount * udif.SectorSize
+
+	switch r.runType {
+	case udif.BlockTerminator:
+		return nil
+	case udif.BlockZero, udif.BlockZeroFill:
+		// A zero run stores no bytes in the data fork.
+		return make([]byte, size)
+	case udif.BlockRaw:
+		if uint64(len(payload)) != size {
+			t.Fatalf("%q raw run %d stores %d bytes for %d sectors", reg.name, i, len(payload), r.sectorCount)
+		}
+		return payload
+	case udif.BlockZLIB:
+		zr, err := zlib.NewReader(bytes.NewReader(payload))
+		if err != nil {
+			t.Fatalf("%q run %d: zlib reader: %v", reg.name, i, err)
+		}
+		plain, err := io.ReadAll(zr)
+		if err != nil {
+			t.Fatalf("%q run %d: inflate: %v", reg.name, i, err)
+		}
+		if err := zr.Close(); err != nil {
+			t.Fatalf("%q run %d: zlib close: %v", reg.name, i, err)
+		}
+		if uint64(len(plain)) != size {
+			t.Fatalf("%q run %d inflates to %d bytes, want %d", reg.name, i, len(plain), size)
+		}
+		return plain
+	default:
+		t.Fatalf("%q run %d has unexpected type %#x", reg.name, i, r.runType)
+		return nil
+	}
 }
 
 func sha256sum(t *testing.T, path string) [32]byte {
@@ -536,13 +705,54 @@ func TestCreatePartitionMap(t *testing.T) {
 				t.Errorf("framed sector count: got %d want %d (%d volume sectors plus the map)", framedSectors, want, bareSectors)
 			}
 
-			// The KOLY keeps saying "partition" even though the data fork
-			// is now a whole disk: hdiutil refuses an image whose variant
-			// is "device" unless the resource fork also splits the BLKX
-			// table per region, which this writer does not do. See the
-			// gpt package doc.
-			if got := koly.ImageVariant; got != udif.ImageVariantPartition {
-				t.Errorf("framed ImageVariant: got %d want %d (partition)", got, udif.ImageVariantPartition)
+			// The data fork is a whole disk, so the KOLY says "device"
+			// and the resource fork carries one blkx table per region.
+			if got := koly.ImageVariant; got != udif.ImageVariantDevice {
+				t.Errorf("framed ImageVariant: got %d want %d (device)", got, udif.ImageVariantDevice)
+			}
+			if got := bareKoly.ImageVariant; got != udif.ImageVariantPartition {
+				t.Errorf("map-less ImageVariant: got %d want %d (partition)", got, udif.ImageVariantPartition)
+			}
+
+			// One resource per region, named the way hdiutil names them,
+			// covering the disk end to end with no gap and no overlap.
+			// A reader that parses the image without mounting it starts
+			// here, so the names carry real weight.
+			regions := blkxRegions(t, raw, koly)
+			wantRegions := []struct {
+				name    string
+				sectors uint64
+			}{
+				{"Protective Master Boot Record (MBR : 0)", 1},
+				{"GPT Header (Primary GPT Header : 1)", 1},
+				{"GPT Partition Data (Primary GPT Table : 2)", gpt.EntryArraySectors},
+				{" (Apple_Free : 3)", gpt.PartitionStartLBA - gpt.FirstUsableLBA},
+				{"disk image (Apple_HFS : 4)", bareSectors},
+				{"GPT Partition Data (Backup GPT Table : 5)", gpt.EntryArraySectors},
+				{"GPT Header (Backup GPT Header : 6)", 1},
+			}
+			if len(regions) != len(wantRegions) {
+				t.Fatalf("framed image has %d blkx resources, want %d", len(regions), len(wantRegions))
+			}
+			var at uint64
+			for i, want := range wantRegions {
+				got := regions[i]
+				if got.name != want.name {
+					t.Errorf("region %d name: got %q want %q", i, got.name, want.name)
+				}
+				if got.sectorCount != want.sectors {
+					t.Errorf("region %d (%s) covers %d sectors, want %d", i, want.name, got.sectorCount, want.sectors)
+				}
+				if got.firstSector != at {
+					t.Errorf("region %d (%s) starts at sector %d, want %d", i, want.name, got.firstSector, at)
+				}
+				if got.descriptor != uint32(i) {
+					t.Errorf("region %d (%s) descriptor: got %d want %d", i, want.name, got.descriptor, i)
+				}
+				at += got.sectorCount
+			}
+			if at != framedSectors {
+				t.Errorf("the regions cover %d sectors, want the disk's %d", at, framedSectors)
 			}
 
 			disk := logicalDisk(t, raw, koly)
