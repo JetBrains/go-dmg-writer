@@ -3,6 +3,15 @@
 // `hdiutil create -layout GPTSPUD` writes. macOS mounts a map-less image
 // fine; the map is for readers that parse a `.dmg` without mounting it.
 // Write-once and little-endian, unlike the big-endian UDIF wrapper.
+//
+// The framing has two halves that must agree. [Layout.LeadingMap] and
+// [Layout.TrailingMap] are the bytes on the disk, and [Layout.Regions]
+// is the same geometry as a list of spans for the UDIF resource fork,
+// which carries one blkx table per span. Change one half and change the
+// other, or the image says two different things about the same disk.
+//
+// Every GUID here is derived rather than random, so two builds of one
+// input give one image; see guidFrom for what that costs.
 package gpt
 
 import (
@@ -119,8 +128,43 @@ func New(volumeSize uint64, name string, when time.Time) (Layout, error) {
 // DiskSize is the framed disk in bytes: leading map, volume, trailing map.
 func (l Layout) DiskSize() uint64 { return l.totalSectors * SectorSize }
 
+// Region is one span of the framed disk, in sector order. Name is the
+// partition's own name and is empty for free space; Type is the
+// partition type as `hdiutil` spells it.
+type Region struct {
+	Name    string
+	Type    string
+	Sectors uint64
+}
+
+// Regions describe the disk one span at a time, so the UDIF resource
+// fork can carry a blkx table per span instead of one table that claims
+// the whole disk is a filesystem. The names are the ones `hdiutil`
+// writes for a GPTSPUD image, and the counts add up to [Layout.DiskSize]
+// in sectors.
+//
+// A reader that parses the image without mounting it starts here, so a
+// wrong name is not cosmetic: it sends that reader to sector 0 expecting
+// a volume header and handing it a protective MBR instead.
+//
+// Unlike hdiutil we leave no free gap in front of the backup table
+// because we do not round the disk up to a multiple of 8 sectors. The
+// map is well-formed either way; it just makes our disk 7 sectors
+// shorter for the same volume.
+func (l Layout) Regions() []Region {
+	return []Region{
+		{Name: "Protective Master Boot Record", Type: "MBR", Sectors: 1},
+		{Name: "GPT Header", Type: "Primary GPT Header", Sectors: 1},
+		{Name: "GPT Partition Data", Type: "Primary GPT Table", Sectors: EntryArraySectors},
+		{Name: "", Type: "Apple_Free", Sectors: PartitionStartLBA - FirstUsableLBA},
+		{Name: partitionName, Type: "Apple_HFS", Sectors: l.volumeSectors},
+		{Name: "GPT Partition Data", Type: "Backup GPT Table", Sectors: EntryArraySectors},
+		{Name: "GPT Header", Type: "Backup GPT Header", Sectors: 1},
+	}
+}
+
 // LeadingMap is the MBR, the primary header, the entries and the unused
-// 34..39 gap. It goes at offset 0 of the disk.
+// 34..39 gaps. It goes at offset 0 of the disk.
 func (l Layout) LeadingMap() []byte {
 	entries := l.entryArray()
 	out := make([]byte, PartitionStartLBA*SectorSize)
@@ -164,10 +208,7 @@ func (l Layout) protectiveMBR() []byte {
 	copy(e[5:8], []byte{0xFE, 0xFF, 0xFF})
 	binary.LittleEndian.PutUint32(e[8:12], 1) // starts at LBA 1
 	// Saturates past 2 TiB, as the spec prescribes; the GPT LBAs stay exact.
-	sectors := l.totalSectors - 1
-	if sectors > 0xFFFFFFFF {
-		sectors = 0xFFFFFFFF
-	}
+	sectors := min(l.totalSectors-1, 0xFFFFFFFF)
 	binary.LittleEndian.PutUint32(e[12:16], uint32(sectors))
 	copy(mbr[510:512], []byte{0x55, 0xAA})
 	return mbr

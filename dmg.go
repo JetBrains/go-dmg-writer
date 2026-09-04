@@ -133,6 +133,15 @@ type DMG struct {
 	// because it starts at the partition map and has nowhere to go.
 	//
 	// The map costs 37 KiB of mostly zero sectors, which compress away.
+	//
+	// The two GUIDs the map needs (one for the disk, one for the
+	// partition) come from a hash of the volume name, [DMG.Time] and
+	// the volume size. A random GUID would make the output
+	// differ between two runs of the same input. The trade-off is that
+	// two images built from those same three values carry the same
+	// GUIDs. macOS does not care, but a tool that treats a partition
+	// GUID as unique between disks does. Give the images different
+	// names or different times if that matters to you.
 	PartitionMap bool
 }
 
@@ -183,7 +192,7 @@ func (d *DMG) Create(srcFolder, outPath string, mode Mode) (err error) {
 		return err
 	}
 
-	// Optionally attach RootFinderInfo as an xattr on the root folder.
+	// Optionally, attach RootFinderInfo as a xattr on the root folder.
 	if d.RootFinderInfo != nil {
 		if got := len(d.RootFinderInfo); got != 32 {
 			return fmt.Errorf("dmg: RootFinderInfo must be exactly 32 bytes (got %d)", got)
@@ -271,6 +280,18 @@ func (d *DMG) Create(srcFolder, outPath string, mode Mode) (err error) {
 	if d.PartitionMap {
 		src = io.MultiReader(bytes.NewReader(layout.LeadingMap()), src, bytes.NewReader(layout.TrailingMap()))
 		srcLen = int64(layout.DiskSize())
+
+		// The resource fork has to describe the framed disk span by
+		// span. Without this the image carries one blkx table that
+		// calls the whole disk a filesystem, and a reader that trusts
+		// it starts reading the protective MBR as a volume header.
+		for _, r := range layout.Regions() {
+			udifOpts.Regions = append(udifOpts.Regions, udif.Region{
+				Name:        r.Name,
+				Type:        r.Type,
+				SectorCount: r.Sectors,
+			})
+		}
 	}
 
 	if err := udif.Write(out, src, srcLen, udifOpts); err != nil {
@@ -351,7 +372,7 @@ func walk(root string, macTime, ownerID, groupID uint32, volumeName string) (*sc
 		return nil, walkErr
 	}
 
-	// Pass 2: materialise Entry / UserFileInput / Attr lists.
+	// Pass 2: materialize Entry / UserFileInput / Attr lists.
 	valence := map[uint32]uint32{}
 	subFolderCount := map[uint32]uint32{}
 	for _, p := range pending {
@@ -440,8 +461,8 @@ func walk(root string, macTime, ownerID, groupID uint32, volumeName string) (*sc
 		}
 	}
 
-	// Backfill folder counters (valence + sub-folder count) for every
-	// folder including the root.
+	// Backfill folder counters (valence + subfolder count) for every
+	// folder, including the root.
 	for _, e := range out.entries {
 		if e.Kind == hfsplus.KindFolder {
 			e.Valence = valence[e.CNID]
@@ -510,8 +531,8 @@ const (
 )
 
 func modeBits(info os.FileInfo) uint16 {
-	// Strip non-permission bits from the Go FileMode; the type bits are
-	// added by the caller via `bitwise-or`.
+	// Strip non-permission bits from the Go FileMode; the caller
+	// adds the type bits via `bitwise-or`.
 	//
 	// Note: on Windows os.FileMode.Perm()
 	// returns synthetic 0o666/0o777 values rather than real POSIX

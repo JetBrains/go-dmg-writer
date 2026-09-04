@@ -35,8 +35,33 @@ const (
 // hdiutil create -srcfolder produces for a folder) this is "partition".
 const partitionVariantNumber = 0xFFFFFFFE // ENTIRE_DEVICE_DESCRIPTOR
 
-// Options configures a [Write] call.
+// Region is one span of the disk that gets its own blkx resource. A
+// map-less image is a single unnamed region and needs none of this; a
+// partitioned image needs one Region per element of its map, because a
+// reader that parses the image without mounting it takes the region
+// table at face value.
+//
+// The resource is named "<Name> (<Type> : <index>)", which is the form
+// `hdiutil` writes and `hdiutil verify` prints. Name is the partition's
+// own name and is empty for free space; Type is the partition type as
+// hdiutil spells it, for example, "Apple_HFS", "Apple_Free" or "MBR".
+type Region struct {
+	Name        string
+	Type        string
+	SectorCount uint64
+}
+
+// Options configure a [Write] call.
 type Options struct {
+	// Regions describe the disk one span at a time, in sector order,
+	// and the counts must add up to the whole image. [Write] then emits
+	// one blkx resource per region and marks the image as a device
+	// rather than as a bare partition.
+	//
+	// Leave it empty for a map-less image: the whole data fork is one
+	// unnamed partition, which is what `hdiutil create -srcfolder`
+	// produces for a folder.
+	Regions []Region
 	// VolumeName is the user-facing label embedded in the blkx resource
 	// "CFName" / "Name" fields ("MyVolume (Apple_HFS : 1)").
 	VolumeName string
@@ -50,12 +75,12 @@ type Options struct {
 	Time time.Time
 	// Workers is the size of the per-chunk compression worker pool. A
 	// value of 0 means runtime.NumCPU(). Set to 1 for fully sequential
-	// behaviour (useful for profiling or low-RAM hosts).
+	// behavior (useful for profiling or low-RAM hosts).
 	//
 	// Output is byte-identical regardless of Workers: chunks are
 	// CRC'd in input order on the producer goroutine, compressed
 	// independently by the workers, and emitted in input order by the
-	// drain. The only thing Workers affects is wall-clock time.
+	// drain. The only thing Workers affect is wall-clock time.
 	Workers int
 }
 
@@ -84,7 +109,7 @@ func Write(dst io.Writer, src io.Reader, srcLen int64, opts Options) error {
 		workers = runtime.NumCPU()
 	}
 	if opts.Compression == CompressionNone {
-		// No compression to parallelise; the producer just CRCs and
+		// No compression to parallelize; the producer just CRCs and
 		// hands the bytes to the writer. Forcing 1 worker keeps the
 		// hot path simple and avoids spawning idle goroutines.
 		workers = 1
@@ -101,60 +126,75 @@ func Write(dst io.Writer, src io.Reader, srcLen int64, opts Options) error {
 	// kernel ~3500 times for a 3.5 GiB input.
 	bdst := bufio.NewWriterSize(dst, 4*chunkBytes)
 
-	dataForkCRC := crc32.NewIEEE()
-	largestRunUnc := uint32(0)
-	if uint64(chunkBytes) <= uint64(srcLen) {
-		largestRunUnc = uint32(chunkBytes)
-	} else {
-		largestRunUnc = uint32(srcLen)
-	}
-
-	runs, dataForkLen, err := encodeChunks(bdst, bsrc, srcLen, chunkBytes, opts.Compression, workers, dataForkCRC)
-	if err != nil {
-		return err
-	}
-
-	runs = append(runs, BlockRun{
-		Type:        BlockTerminator,
-		SectorStart: totalSectors,
-		SectorCount: 0,
-		CompOffset:  dataForkLen,
-		CompLength:  0,
-	})
-
-	blkx := &BlkxTable{
-		Signature:              MishSignature,
-		InfoVersion:            1,
-		FirstSectorNumber:      0,
-		SectorCount:            totalSectors,
-		DataStart:              0,
-		DecompressBufRequested: (largestRunUnc + SectorSize - 1) / SectorSize,
-		BlocksDescriptor:       partitionVariantNumber,
-		Checksum: UDIFChecksum{
-			Type: ChecksumCRC32,
-			Size: 32,
-			Data: [32]uint32{dataForkCRC.Sum32()},
-		},
-		Runs: runs,
-	}
-
-	blkxBytes := blkx.Encode()
-
-	rf := NewResourceFork()
 	volName := opts.VolumeName
 	if volName == "" {
 		volName = "disk image"
 	}
-	rf.Add("blkx", Resource{
-		ID: 0,
-		// "Apple_HFSX" tells macOS the partition holds an HFSX
-		// filesystem (case-sensitive HFS+ variant). Plain HFS+ would
-		// be "Apple_HFS"; we use HFSX so the catalog can use simple
-		// binary key comparison without an Apple case-folding table.
-		Name:       fmt.Sprintf("%s (Apple_HFSX : 1)", volName),
-		Attributes: AttributeHdiutil,
-		Data:       blkxBytes,
-	})
+
+	specs, imageVariant, err := blkxSpecs(opts.Regions, volName, totalSectors)
+	if err != nil {
+		return err
+	}
+
+	// One blkx table per region, encoded in sector order so the single
+	// pass over src stays a single pass. dataForkLen runs across the
+	// whole fork, because a run's CompOffset is an absolute offset into
+	// it even though its SectorStart is relative to its own region.
+	rf := NewResourceFork()
+	var (
+		dataForkLen uint64
+		tableCRCs   []uint32
+	)
+	dataForkCRC := crc32.NewIEEE()
+	for _, s := range specs {
+		regionLen := int64(s.sectors) * SectorSize
+		largestRunUnc := uint32(chunkBytes)
+		if int64(chunkBytes) > regionLen {
+			largestRunUnc = uint32(regionLen)
+		}
+
+		// The table's own CRC covers only its region; dataForkCRC spans
+		// the lot and ends up in the KOLY. Neither sees the sectors of
+		// a BlockZero run, which `encodeChunks` leaves out.
+		tableCRC := crc32.NewIEEE()
+		runs, next, err := encodeChunks(bdst, bsrc, regionLen, dataForkLen, chunkBytes,
+			opts.Compression, workers, io.MultiWriter(tableCRC, dataForkCRC))
+		if err != nil {
+			return err
+		}
+		dataForkLen = next
+
+		runs = append(runs, BlockRun{
+			Type:        BlockTerminator,
+			SectorStart: s.sectors,
+			SectorCount: 0,
+			CompOffset:  dataForkLen,
+			CompLength:  0,
+		})
+
+		blkx := &BlkxTable{
+			Signature:              MishSignature,
+			InfoVersion:            1,
+			FirstSectorNumber:      s.firstSector,
+			SectorCount:            s.sectors,
+			DataStart:              0,
+			DecompressBufRequested: (largestRunUnc + SectorSize - 1) / SectorSize,
+			BlocksDescriptor:       s.descriptor,
+			Checksum: UDIFChecksum{
+				Type: ChecksumCRC32,
+				Size: 32,
+				Data: [32]uint32{tableCRC.Sum32()},
+			},
+			Runs: runs,
+		}
+		tableCRCs = append(tableCRCs, tableCRC.Sum32())
+		rf.Add("blkx", Resource{
+			ID:         s.id,
+			Name:       s.name,
+			Attributes: AttributeHdiutil,
+			Data:       blkx.Encode(),
+		})
+	}
 	rf.Add("plst", Resource{
 		ID:         0,
 		Name:       "",
@@ -172,7 +212,7 @@ func Write(dst io.Writer, src io.Reader, srcLen int64, opts Options) error {
 		return err
 	}
 
-	masterCRC := MasterChecksum([]uint32{dataForkCRC.Sum32()})
+	masterCRC := MasterChecksum(tableCRCs)
 	koly := Koly{
 		Signature:        KolySignature,
 		Version:          KolyVersion,
@@ -187,7 +227,7 @@ func Write(dst io.Writer, src io.Reader, srcLen int64, opts Options) error {
 		XMLOffset:        xmlOffset,
 		XMLLength:        xmlLen,
 		MasterChecksum:   UDIFChecksum{Type: ChecksumCRC32, Size: 32, Data: [32]uint32{masterCRC}},
-		ImageVariant:     ImageVariantPartition,
+		ImageVariant:     imageVariant,
 		SectorCount:      totalSectors,
 	}
 	kolyBuf := koly.Encode()
@@ -197,10 +237,73 @@ func Write(dst io.Writer, src io.Reader, srcLen int64, opts Options) error {
 	return bdst.Flush()
 }
 
-// encodeChunks streams `srcLen` bytes from src in chunks of chunkBytes,
+// blkxSpec is everything about one blkx resource that does not come out
+// of the sector data itself.
+type blkxSpec struct {
+	name        string
+	id          int32
+	descriptor  uint32
+	firstSector uint64
+	sectors     uint64
+}
+
+// blkxSpecs turns the caller's regions into one spec per blkx resource
+// and picks the KOLY's ImageVariant to match. No regions mean the old
+// single-table layout, so a map-less image keeps the bytes it had.
+func blkxSpecs(regions []Region, volName string, totalSectors uint64) ([]blkxSpec, uint32, error) {
+	if len(regions) == 0 {
+		return []blkxSpec{{
+			// "Apple_HFSX" tells macOS the partition holds an HFSX
+			// filesystem (case-sensitive HFS+ variant). Plain HFS+
+			// would be "Apple_HFS"; we use HFSX so the catalog can use
+			// simple binary key comparison without an Apple
+			// case-folding table.
+			name:       fmt.Sprintf("%s (Apple_HFSX : 1)", volName),
+			id:         0,
+			descriptor: partitionVariantNumber,
+			sectors:    totalSectors,
+		}}, ImageVariantPartition, nil
+	}
+
+	specs := make([]blkxSpec, 0, len(regions))
+	var first uint64
+	for i, r := range regions {
+		if r.SectorCount == 0 {
+			return nil, 0, fmt.Errorf("udif: region %d (%s) covers no sectors", i, r.Type)
+		}
+		specs = append(specs, blkxSpec{
+			name: fmt.Sprintf("%s (%s : %d)", r.Name, r.Type, i),
+			// hdiutil numbers blkx resources from -1, so the payload
+			// partition of a GPTSPUD image lands on ID 3. Nothing reads
+			// the ID, but a diff against a real image is easier to
+			// trust when even the boring fields line up.
+			id:          int32(i) - 1,
+			descriptor:  uint32(i),
+			firstSector: first,
+			sectors:     r.SectorCount,
+		})
+		first += r.SectorCount
+	}
+	if first != totalSectors {
+		return nil, 0, fmt.Errorf("udif: regions cover %d sectors, want %d", first, totalSectors)
+	}
+	// A region table describes a whole device, not a bare partition.
+	return specs, ImageVariantDevice, nil
+}
+
+// encodeChunks streams `regionLen` bytes from src in chunks of chunkBytes,
 // optionally zlib-compressing each chunk, and writes the encoded bytes
-// to dst in input order. Returns the runs slice (without the trailing
-// terminator) and the cumulative data-fork length.
+// to dst in input order.
+//
+// SectorStart in the returned runs counts from the start of this region,
+// which is what a blkx table wants, while CompOffset counts from the
+// start of the whole data fork: hence baseOffset, the fork length so far.
+// Returns the run slice (without the trailing terminator) and the fork
+// length after this region.
+//
+// CRC sees every chunk that reaches the data fork and never sees an
+// all-zero one, because an all-zero chunk becomes a [BlockZero] run and
+// a blkx checksum leaves those sectors out.
 //
 // Concurrency: the caller's goroutine reads chunks sequentially (so
 // CRC32 and the per-chunk read order stay deterministic), dispatches
@@ -213,17 +316,17 @@ func Write(dst io.Writer, src io.Reader, srcLen int64, opts Options) error {
 func encodeChunks(
 	dst io.Writer,
 	src io.Reader,
-	srcLen int64,
+	regionLen int64,
+	baseOffset uint64,
 	chunkBytes int,
 	compression Compression,
 	workers int,
-	dataForkCRC interface {
-		Write([]byte) (int, error)
-	},
+	crc io.Writer,
 ) ([]BlockRun, uint64, error) {
 	type chunkJob struct {
 		idx         int
 		sectorStart uint64
+		zero        bool   // decided by the producer, which also owns the CRC
 		buf         []byte // newly allocated; worker takes ownership
 	}
 	type chunkResult struct {
@@ -252,7 +355,7 @@ func encodeChunks(
 			for j := range jobs {
 				secCount := uint64(len(j.buf)) / SectorSize
 				switch {
-				case isAllZero(j.buf):
+				case j.zero:
 					results <- chunkResult{
 						idx:         j.idx,
 						runType:     BlockZero,
@@ -320,7 +423,7 @@ func encodeChunks(
 	go func() {
 		var (
 			runs        []BlockRun
-			dataForkLen uint64
+			dataForkLen = baseOffset
 			pending     = map[int]chunkResult{}
 			nextIdx     int
 		)
@@ -363,7 +466,7 @@ func encodeChunks(
 		nextSector  uint64
 		producerErr error
 	)
-	remaining := srcLen
+	remaining := regionLen
 producer:
 	for remaining > 0 {
 		thisChunk := chunkBytes
@@ -375,9 +478,15 @@ producer:
 			producerErr = fmt.Errorf("udif: reading source: %w", err)
 			break
 		}
-		if _, err := dataForkCRC.Write(buf); err != nil {
-			producerErr = fmt.Errorf("udif: crc32 update: %w", err)
-			break
+		// An all-zero chunk becomes a BlockZero run, whose sectors a
+		// blkx checksum skips, so it must not reach the CRC either.
+		// The worker is told the answer rather than recomputing it.
+		zero := isAllZero(buf)
+		if !zero {
+			if _, err := crc.Write(buf); err != nil {
+				producerErr = fmt.Errorf("udif: crc32 update: %w", err)
+				break
+			}
 		}
 		secCount := uint64(thisChunk) / SectorSize
 
@@ -390,7 +499,7 @@ producer:
 		default:
 		}
 
-		jobs <- chunkJob{idx: idx, sectorStart: nextSector, buf: buf}
+		jobs <- chunkJob{idx: idx, sectorStart: nextSector, zero: zero, buf: buf}
 
 		idx++
 		nextSector += secCount
