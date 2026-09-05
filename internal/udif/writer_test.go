@@ -3,9 +3,11 @@ package udif
 import (
 	"bytes"
 	"compress/zlib"
+	"errors"
 	"hash/crc32"
 	"io"
 	"testing"
+	"testing/iotest"
 	"time"
 )
 
@@ -110,7 +112,7 @@ func TestWriteUDZOAllZeroBecomesSparse(t *testing.T) {
 		t.Fatalf("DecodeKoly: %v", err)
 	}
 	// All-zero source should produce a data fork much smaller than the
-	// original — every chunk should be BLOCK_ZERO with CompLength=0.
+	// original - every chunk should be BLOCK_ZERO with CompLength=0.
 	if koly.DataForkLength != 0 {
 		t.Errorf("DataForkLength: got %d want 0 (all chunks should be sparse)", koly.DataForkLength)
 	}
@@ -245,6 +247,110 @@ func TestBlkxSpecsRejectsBadRegions(t *testing.T) {
 				t.Error("blkxSpecs accepted a region list it should reject")
 			}
 		})
+	}
+}
+
+// failAfterWriter accepts `ok` bytes and then fails every write, which
+// is how a full disk, a closed file or a broken pipe behaves.
+type failAfterWriter struct {
+	ok        int
+	written   int
+	failWith  error
+	failCount int
+}
+
+func (w *failAfterWriter) Write(p []byte) (int, error) {
+	if w.written >= w.ok {
+		w.failCount++
+		return 0, w.failWith
+	}
+	n := len(p)
+	if w.written+n > w.ok {
+		n = w.ok - w.written
+	}
+	w.written += n
+	if n < len(p) {
+		w.failCount++
+		return n, w.failWith
+	}
+	return n, nil
+}
+
+// TestWriteReportsWriteError pins the deadlock that used to hide here.
+// The drain goroutine reported the failed write and stopped reading
+// `results`, so the workers blocked on their sends, nothing closed
+// `results`, and the producer wedged on a full `jobs` channel: a failed
+// write hung [Write] instead of returning from it.
+//
+// Both compression modes are covered because they take different paths
+// through the worker pool (zlib runs a real pool, none forces workers=1).
+func TestWriteReportsWriteError(t *testing.T) {
+	errFull := errors.New("no space left on device")
+	modes := []struct {
+		name string
+		comp Compression
+	}{
+		{"none", CompressionNone},
+		{"zlib", CompressionZlib},
+	}
+	for _, m := range modes {
+		t.Run(m.name, func(t *testing.T) {
+			// 8 MiB of incompressible-ish data through 64 KiB chunks
+			// gives the producer far more chunks than the channels
+			// buffer, so it is guaranteed to still be dispatching when
+			// the write fails.
+			const size = 8 * 1024 * 1024
+			dst := &failAfterWriter{ok: 4096, failWith: errFull}
+
+			donec := make(chan error, 1)
+			go func() {
+				donec <- Write(dst, newFakeSrc(size), size, Options{
+					VolumeName:   "vol",
+					Compression:  m.comp,
+					ChunkSectors: 128,
+					Workers:      4,
+				})
+			}()
+
+			select {
+			case err := <-donec:
+				if err == nil {
+					t.Fatal("Write returned nil after the destination failed")
+				}
+				if !errors.Is(err, errFull) {
+					t.Errorf("Write error: got %v, want one wrapping %v", err, errFull)
+				}
+			case <-time.After(30 * time.Second):
+				t.Fatal("Write did not return within 30s after a write error (deadlock)")
+			}
+		})
+	}
+}
+
+// TestWriteReportsReadError is the mirror image: the source fails
+// mid-stream and Write has to surface that rather than pad the image out.
+func TestWriteReportsReadError(t *testing.T) {
+	errIO := errors.New("input/output error")
+	const size = 1024 * 1024
+	src := io.MultiReader(bytes.NewReader(make([]byte, 4096)), iotest.ErrReader(errIO))
+
+	donec := make(chan error, 1)
+	go func() {
+		var out bytes.Buffer
+		donec <- Write(&out, src, size, Options{
+			Compression:  CompressionZlib,
+			ChunkSectors: 8,
+			Workers:      4,
+		})
+	}()
+
+	select {
+	case err := <-donec:
+		if err == nil {
+			t.Fatal("Write returned nil after the source failed")
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("Write did not return within 30s after a read error (deadlock)")
 	}
 }
 
