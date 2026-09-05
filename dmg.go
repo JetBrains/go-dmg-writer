@@ -316,10 +316,13 @@ func walk(root string, macTime, ownerID, groupID uint32, volumeName string) (*sc
 	parentMap[root] = hfsplus.CNIDRootFolder
 
 	// Root folder entry. The root's name IS the volume name: HFS+/HFSX
-	// don't have a separate "volume label" field, the volume name field
-	// in the volume header is literally the name on the root folder's
-	// catalog record.
-	rootEntry := newFolderEntry(hfsplus.CNIDRootFolder, hfsplus.CNIDRootParent, volumeName, macTime, ownerID, groupID, 0o755)
+	// have no separate volume-label field, so a name the catalog cannot
+	// hold has to fail here rather than ship a volume with no name.
+	rootName, err := hfsplus.NewName(volumeName)
+	if err != nil {
+		return nil, fmt.Errorf("dmg: volume name %q: %w", volumeName, err)
+	}
+	rootEntry := newFolderEntry(hfsplus.CNIDRootFolder, hfsplus.CNIDRootParent, rootName, macTime, ownerID, groupID, 0o755)
 	out.entries = append(out.entries, rootEntry)
 
 	nextCNID := hfsplus.CNIDFirstUser
@@ -376,12 +379,29 @@ func walk(root string, macTime, ownerID, groupID uint32, volumeName string) (*sc
 	// Pass 2: materialize Entry / UserFileInput / Attr lists.
 	valence := map[uint32]uint32{}
 	subFolderCount := map[uint32]uint32{}
+	// A catalog key is (parent CNID, NFD name), so two names in one
+	// directory that differ only in Unicode composition collapse to one
+	// key, which a catalog cannot hold. Catching it here is what lets
+	// the error name the two paths; the packers check the same
+	// invariant without them. See the wiki, "HFS+ Format":
+	// https://github.com/JetBrains/go-dmg-writer/wiki/HFS+-Format
+	type dirName struct {
+		parent uint32
+		name   string
+	}
+	claimed := make(map[dirName]string, len(pending))
 	for _, p := range pending {
 		base := filepath.Base(p.path)
 		name, err := hfsplus.NewName(base)
 		if err != nil {
 			return nil, fmt.Errorf("dmg: name %q: %w", base, err)
 		}
+		key := dirName{parent: p.parent, name: string(name.Bytes())}
+		if first, dup := claimed[key]; dup {
+			return nil, fmt.Errorf("dmg: %q and %q normalize to the same HFS+ name %q; "+
+				"a catalog cannot hold both, rename one of them", first, p.path, base)
+		}
+		claimed[key] = p.path
 		valence[p.parent]++
 
 		switch {
@@ -419,8 +439,7 @@ func walk(root string, macTime, ownerID, groupID uint32, volumeName string) (*sc
 			})
 
 		case p.info.IsDir():
-			entry := newFolderEntry(p.cnid, p.parent, base, macTime, ownerID, groupID, modeBits(p.info))
-			entry.Name = name
+			entry := newFolderEntry(p.cnid, p.parent, name, macTime, ownerID, groupID, modeBits(p.info))
 			subFolderCount[p.parent]++
 			out.entries = append(out.entries, entry)
 			attrs, err := xattrs.ReadXattrs(p.path, p.cnid)
@@ -542,12 +561,15 @@ func modeBits(info os.FileInfo) uint16 {
 	return uint16(info.Mode().Perm())
 }
 
-func newFolderEntry(cnid, parent uint32, name string, macTime, ownerID, groupID uint32, mode uint16) *hfsplus.Entry {
-	n, _ := hfsplus.NewName(name)
+// newFolderEntry takes an already-converted [hfsplus.HFSName] rather
+// than a string: the conversion can fail (a name over 255 UTF-16 code
+// units), and a constructor that cannot report that failure would have
+// to swallow it and hand back a folder with no name.
+func newFolderEntry(cnid, parent uint32, name hfsplus.HFSName, macTime, ownerID, groupID uint32, mode uint16) *hfsplus.Entry {
 	return &hfsplus.Entry{
 		CNID:             cnid,
 		ParentCNID:       parent,
-		Name:             n,
+		Name:             name,
 		Kind:             hfsplus.KindFolder,
 		Mode:             mode | dirTypeBits,
 		OwnerID:          ownerID,
