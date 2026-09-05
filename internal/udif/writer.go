@@ -44,7 +44,7 @@ const partitionVariantNumber = 0xFFFFFFFE // ENTIRE_DEVICE_DESCRIPTOR
 // The resource is named "<Name> (<Type> : <index>)", which is the form
 // `hdiutil` writes and `hdiutil verify` prints. Name is the partition's
 // own name and is empty for free space; Type is the partition type as
-// hdiutil spells it, for example, "Apple_HFS", "Apple_Free" or "MBR".
+// hdiutil spells it, for example, "Apple_HFSX", "Apple_Free" or "MBR".
 type Region struct {
 	Name        string
 	Type        string
@@ -63,7 +63,8 @@ type Options struct {
 	// produces for a folder.
 	Regions []Region
 	// VolumeName is the user-facing label embedded in the blkx resource
-	// "CFName" / "Name" fields ("MyVolume (Apple_HFS : 1)").
+	// "CFName" / "Name" fields ("MyVolume (Apple_HFSX : 1)"). Regions,
+	// if set, name their own spans, and this only seeds the SegmentID.
 	VolumeName string
 	// Compression selects the per-chunk encoding.
 	Compression Compression
@@ -253,11 +254,10 @@ type blkxSpec struct {
 func blkxSpecs(regions []Region, volName string, totalSectors uint64) ([]blkxSpec, uint32, error) {
 	if len(regions) == 0 {
 		return []blkxSpec{{
-			// "Apple_HFSX" tells macOS the partition holds an HFSX
-			// filesystem (case-sensitive HFS+ variant). Plain HFS+
-			// would be "Apple_HFS"; we use HFSX so the catalog can use
-			// simple binary key comparison without an Apple
-			// case-folding table.
+			// "Apple_HFSX", not "Apple_HFS": the type names the
+			// filesystem, and we always write HFSX. gpt.Layout.Regions
+			// says the same for a framed image; see the wiki:
+			// https://github.com/JetBrains/go-dmg-writer/wiki/UDIF-Format
 			name:       fmt.Sprintf("%s (Apple_HFSX : 1)", volName),
 			id:         0,
 			descriptor: partitionVariantNumber,
@@ -346,6 +346,10 @@ func encodeChunks(
 	jobs := make(chan chunkJob, workers*2)
 	results := make(chan chunkResult, workers*2)
 	errCh := make(chan error, workers+1)
+	// Closed by the drain once a write to dst fails, which tells the
+	// producer to stop reading rather than feed chunks nobody will
+	// write. The drain keeps consuming `results` either way; see below.
+	done := make(chan struct{})
 
 	var wg sync.WaitGroup
 	for w := 0; w < workers; w++ {
@@ -426,8 +430,18 @@ func encodeChunks(
 			dataForkLen = baseOffset
 			pending     = map[int]chunkResult{}
 			nextIdx     int
+			writeErr    error
 		)
+		// `results` is read to close even after a write failure.
+		// Returning early here deadlocks [Write] instead of reporting
+		// the failure: the workers stay blocked on their sends, so
+		// nothing ever closes `results`. See "Failure handling in the
+		// parallel pipeline" on the wiki:
+		// https://github.com/JetBrains/go-dmg-writer/wiki/Architecture
 		for r := range results {
+			if writeErr != nil {
+				continue // discard; we are only here to unblock the workers
+			}
 			pending[r.idx] = r
 			for {
 				cur, ok := pending[nextIdx]
@@ -446,13 +460,20 @@ func encodeChunks(
 				if len(cur.payload) > 0 {
 					run.CompLength = uint64(len(cur.payload))
 					if err := writeBytes(dst, cur.payload); err != nil {
-						drainCh <- drainOut{err: err}
-						return
+						writeErr = err
+						// Stop the producer: everything after this point
+						// would be compressed only to be thrown away.
+						close(done)
+						break
 					}
 					dataForkLen += uint64(len(cur.payload))
 				}
 				runs = append(runs, run)
 			}
+		}
+		if writeErr != nil {
+			drainCh <- drainOut{err: writeErr}
+			return
 		}
 		drainCh <- drainOut{runs: runs, dataForkLen: dataForkLen}
 	}()
@@ -490,16 +511,20 @@ producer:
 		}
 		secCount := uint64(thisChunk) / SectorSize
 
-		// If a worker has already errored, stop dispatching so we
-		// don't pile up jobs that nobody will consume.
+		// The dispatch and the "has anything failed?" check have to be
+		// one operation. A worker that fails between a separate check
+		// and a bare send leaves this goroutine on a send with no
+		// reader left to take it.
 		select {
+		case jobs <- chunkJob{idx: idx, sectorStart: nextSector, zero: zero, buf: buf}:
 		case err := <-errCh:
 			producerErr = err
 			break producer
-		default:
+		case <-done:
+			// The drain failed to write; its error comes back through
+			// drainCh, so we just stop feeding it.
+			break producer
 		}
-
-		jobs <- chunkJob{idx: idx, sectorStart: nextSector, zero: zero, buf: buf}
 
 		idx++
 		nextSector += secCount
