@@ -229,7 +229,7 @@ func streamFileAt(out io.WriteSeeker, off int64, opener FileOpener, size uint64)
 	if err != nil {
 		return err
 	}
-	// io.CopyN stops at `size` and reports success no mater if the
+	// io.CopyN stops at `size` and reports success no matter if the
 	// source has more, so a file that grew would be truncated into the
 	// image silently. One more read tells the two apart.
 	var probe [1]byte

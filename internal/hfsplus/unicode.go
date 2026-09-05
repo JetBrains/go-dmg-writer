@@ -25,7 +25,7 @@ type HFSName struct {
 // (Apple's canonical decomposition) then UTF-16. Note that Apple's NFD
 // differs from standard Unicode NFD in a handful of code points
 // (U+2000-U+2FFF, certain Hangul forms). For the common case of ASCII
-// names — which is what an app-bundle DMG typically contains — the two
+// names - which is what an app-bundle DMG typically contains - the two
 // forms are identical. Non-ASCII names should still mount correctly but
 // may not match the byte-for-byte output of macOS's own `hdiutil`.
 //

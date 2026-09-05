@@ -74,14 +74,13 @@ const MinNodeSize = 512
 
 // mapBitsInHeaderNode is how many "node is in use" bits fit in the
 // header node's map record: everything left after the descriptor, the
-// four-entry offset table, the BTHeaderRec and the 128-byte user-data
+// four-entry offset table, the BTHeaderRec, and the 128-byte user-data
 // record.
 //
 // This and [mapBitsInMapNode] are the single source of truth for the
-// map's geometry, so the node-count loop, the two emitters and
+// map's geometry, so the node-count loop, the two emitters, and
 // [BuildResult.PadToBlocks] cannot drift apart and leave a used node
-// marked free. The map is described on the wiki:
-// https://github.com/JetBrains/go-dmg-writer/wiki/BTree
+// marked free. Refer to the project's Wiki for in-depth information.
 func mapBitsInHeaderNode(nodeSize int) int {
 	return (nodeSize - BTNodeDescriptorSize - 4*2 - BTHeaderRecSize - 128) * 8
 }

@@ -31,9 +31,12 @@ func main() {
   `RootFinderInfo` field for setting a custom volume icon / Finder window.
 - **Optional GUID partition table** — set `PartitionMap: true` to frame the
   volume as a whole disk (protective MBR, primary and backup GPT, one
-  `Apple_HFS` partition), matching `hdiutil create -layout GPTSPUD`. macOS
-  mounts a map-less image fine; the map is what a tool that *parses* a
-  `.dmg` without mounting it needs.
+  partition carrying Apple's HFS type GUID), matching
+  `hdiutil create -layout GPTSPUD`. macOS mounts a map-less image fine; the
+  map is what a tool that *parses* a `.dmg` without mounting it needs. Note
+  that the framed layout names its payload partition `disk image` rather
+  than `VolumeName`, exactly as `hdiutil` does; `VolumeName` is still what
+  Finder shows, because it lives on the volume's root folder.
 - **Deterministic output** — given the same source folder and a fixed
   `Time`, repeated runs produce byte-identical DMGs (useful for
   reproducible builds and CI caching).

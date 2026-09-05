@@ -23,7 +23,7 @@ func TestNewNameASCII(t *testing.T) {
 }
 
 func TestNewNameNonASCII(t *testing.T) {
-	// "café" — the 'é' (U+00E9) decomposes to 'e' + U+0301 (combining acute).
+	// "café" - the 'é' (U+00E9) decomposes to 'e' + U+0301 (combining acute).
 	n, err := NewName("café")
 	if err != nil {
 		t.Fatalf("NewName: %v", err)
