@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"sort"
+	"unicode/utf16"
 )
 
 // Attribute record types (HFSPlusAttrRecord.recordType field).
@@ -40,6 +41,16 @@ func BuildAttributesTree(attrs []Attr) (*BuildResult, error) {
 	sort.Slice(records, func(i, j int) bool {
 		return compareAttrKeys(records[i].Key, records[j].Key) < 0
 	})
+	// One (fileID, name) pair may appear only once. A repeat - the same
+	// xattr listed twice, or two names that match after NFD - gives two
+	// equal keys: a corrupt tree, and a non-deterministic order, since
+	// sort.Slice is not stable.
+	for i := 1; i < len(records); i++ {
+		if compareAttrKeys(records[i-1].Key, records[i].Key) == 0 {
+			fileID, name := describeAttrKey(records[i].Key)
+			return nil, fmt.Errorf("hfsplus: two attribute records for %q on cnid %d", name, fileID)
+		}
+	}
 	return BuildTree(records, BuildOpts{
 		NodeSize:       AttributesNodeSize,
 		Attributes:     BTBigKeysMask | BTVariableIndexKeys,
@@ -94,6 +105,18 @@ func encodeAttrKey(fileID, startBlock uint32, name HFSName) []byte {
 	binary.BigEndian.PutUint16(buf[10:12], uint16(name.LenU16()))
 	copy(buf[12:], nameBytes)
 	return buf
+}
+
+// describeAttrKey decodes a key body back into its file ID and a
+// readable attribute name, for error messages.
+func describeAttrKey(key []byte) (uint32, string) {
+	fileID := binary.BigEndian.Uint32(key[2:6])
+	n := int(binary.BigEndian.Uint16(key[10:12]))
+	units := make([]uint16, 0, n)
+	for i := 0; i < n && 12+i*2+2 <= len(key); i++ {
+		units = append(units, binary.BigEndian.Uint16(key[12+i*2:12+i*2+2]))
+	}
+	return fileID, string(utf16.Decode(units))
 }
 
 func compareAttrKeys(a, b []byte) int {
