@@ -56,6 +56,11 @@ func main() {
 	if err := d.Create(*srcFlag, *outFlag, mode); err != nil {
 		log.Fatalf("dmg create: %v", err)
 	}
-	st, _ := os.Stat(*outFlag)
-	fmt.Fprintf(os.Stderr, "wrote %s (%d bytes)\n", *outFlag, st.Size())
+	// The image is already written at this point, so a failure to stat it
+	// is not worth exiting over; report the path without the size.
+	if st, err := os.Stat(*outFlag); err == nil {
+		fmt.Fprintf(os.Stderr, "wrote %s (%d bytes)\n", *outFlag, st.Size())
+	} else {
+		fmt.Fprintf(os.Stderr, "wrote %s\n", *outFlag)
+	}
 }
