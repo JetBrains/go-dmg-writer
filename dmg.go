@@ -45,6 +45,7 @@ import (
 	"github.com/jetbrains/go-dmg-writer/internal/gpt"
 	"github.com/jetbrains/go-dmg-writer/internal/hfsplus"
 	"github.com/jetbrains/go-dmg-writer/internal/udif"
+	"github.com/jetbrains/go-dmg-writer/internal/xattrs"
 )
 
 // Mode selects how the produced DMG encodes its data fork.
@@ -422,7 +423,7 @@ func walk(root string, macTime, ownerID, groupID uint32, volumeName string) (*sc
 			entry.Name = name
 			subFolderCount[p.parent]++
 			out.entries = append(out.entries, entry)
-			attrs, err := readXattrs(p.path, p.cnid)
+			attrs, err := xattrs.ReadXattrs(p.path, p.cnid)
 			if err != nil {
 				return nil, err
 			}
@@ -453,7 +454,7 @@ func walk(root string, macTime, ownerID, groupID uint32, volumeName string) (*sc
 					return os.Open(path)
 				},
 			})
-			attrs, err := readXattrs(p.path, p.cnid)
+			attrs, err := xattrs.ReadXattrs(p.path, p.cnid)
 			if err != nil {
 				return nil, err
 			}
