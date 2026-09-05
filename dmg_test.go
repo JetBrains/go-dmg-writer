@@ -319,6 +319,78 @@ func TestCreateRootFinderInfoBadSize(t *testing.T) {
 	}
 }
 
+// TestCreateRejectsOversizedVolumeName: the volume name IS the root
+// folder's catalog name, so a name the catalog cannot hold has to fail.
+// It used to be dropped on the floor, producing an image with no volume
+// name at all and a nil error.
+func TestCreateRejectsOversizedVolumeName(t *testing.T) {
+	src := makeSourceTree(t)
+	out := filepath.Join(t.TempDir(), "longname.dmg")
+	d := &DMG{
+		VolumeName: strings.Repeat("A", 300), // over the 255 code-unit limit
+		Time:       time.Unix(1700000000, 0).UTC(),
+	}
+	err := d.Create(src, out, ModeReadOnly)
+	if err == nil {
+		t.Fatal("Create accepted a 300-character volume name")
+	}
+	if !strings.Contains(err.Error(), "volume name") {
+		t.Errorf("error should name the offending field, got: %v", err)
+	}
+	if _, statErr := os.Stat(out); statErr == nil {
+		t.Error("Create left an output file behind after rejecting the volume name")
+	}
+}
+
+// TestCreateAcceptsMaxLengthVolumeName is the other side of the bound:
+// exactly 255 code units still has to work.
+func TestCreateAcceptsMaxLengthVolumeName(t *testing.T) {
+	src := makeSourceTree(t)
+	out := filepath.Join(t.TempDir(), "maxname.dmg")
+	d := &DMG{
+		VolumeName: strings.Repeat("A", 255),
+		Time:       time.Unix(1700000000, 0).UTC(),
+	}
+	if err := d.Create(src, out, ModeReadOnly); err != nil {
+		t.Fatalf("Create rejected a 255-character volume name: %v", err)
+	}
+}
+
+// TestCreateRejectsNamesCollidingUnderNFD: HFS+ catalog keys hold the NFD
+// form of a name, so "é" written as U+00E9 and as "e" plus U+0301 are one
+// key. A Linux filesystem keeps both files; the catalog cannot. Writing
+// both used to succeed and produce a catalog with two equal keys.
+func TestCreateRejectsNamesCollidingUnderNFD(t *testing.T) {
+	precomposed := "caf\u00e9.txt" // é as one code point
+	decomposed := "cafe\u0301.txt" // e + combining acute
+	root := t.TempDir()
+	mustWrite(t, filepath.Join(root, precomposed), "one\n")
+	if err := os.WriteFile(filepath.Join(root, decomposed), []byte("two\n"), 0o644); err != nil {
+		// A filesystem that normalizes names itself (APFS, HFS+) stores
+		// these as one file, so there is nothing to collide.
+		t.Skipf("filesystem cannot hold both spellings: %v", err)
+	}
+	ents, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ents) < 2 {
+		t.Skip("filesystem normalized the two names into one file")
+	}
+
+	out := filepath.Join(t.TempDir(), "nfd.dmg")
+	d := &DMG{Time: time.Unix(1700000000, 0).UTC()}
+	err = d.Create(root, out, ModeReadOnly)
+	if err == nil {
+		t.Fatal("Create accepted two names that normalize to the same catalog key")
+	}
+	// The message has to name both paths; that is the whole point of
+	// catching this in the walk rather than in the packer.
+	if !strings.Contains(err.Error(), precomposed) || !strings.Contains(err.Error(), decomposed) {
+		t.Errorf("error should name both source paths, got: %v", err)
+	}
+}
+
 // TestCreateDeterministicWithRootFinderInfo verifies determinism is
 // preserved when an extra xattr (the RootFinderInfo) is injected. The
 // attributes B-tree's record ordering are stable and shouldn't drift
