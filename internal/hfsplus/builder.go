@@ -76,8 +76,8 @@ func WriteVolume(out io.WriteSeeker, in *VolumeInputs) (volumeSize uint64, err e
 		}
 	}
 
-	// 1. Pack the trees once with placeholder file extents — that is the
-	// first time we learn how big each tree's bytes are. The record
+	// 1. Pack all trees with placeholder file extents to
+	// get how big each tree's bytes are. The record
 	// sizes don't depend on the extent values, so the result of the
 	// second pack below is guaranteed identical in size.
 	catRes, err := BuildCatalogTree(in.Entries, CatalogNodeSize)
@@ -150,8 +150,16 @@ func WriteVolume(out io.WriteSeeker, in *VolumeInputs) (volumeSize uint64, err e
 		return 0, err
 	}
 
-	// 8. Write the allocation bitmap.
-	if err := writeAt(out, int64(plan.AllocStartBlock)*int64(plan.BlockSize), plan.AllocBitmap.Bytes()); err != nil {
+	// 8. Write the allocation bitmap. The size check is not decoration:
+	// the bitmap is written as one run at AllocStartBlock, so a bitmap
+	// larger than its own fork silently overwrites the catalog that
+	// follows it. Refusing to write beats shipping a corrupt image.
+	bitmap := plan.AllocBitmap.Bytes()
+	if forkBytes := uint64(plan.AllocFile.TotalBlocks) * uint64(plan.BlockSize); uint64(len(bitmap)) > forkBytes {
+		return 0, fmt.Errorf("hfsplus: allocation bitmap is %d bytes but its fork holds %d",
+			len(bitmap), forkBytes)
+	}
+	if err := writeAt(out, int64(plan.AllocStartBlock)*int64(plan.BlockSize), bitmap); err != nil {
 		return 0, err
 	}
 

@@ -60,6 +60,23 @@ type FilePlacement struct {
 	Blocks     uint32
 }
 
+// forkBlocks converts a special file's byte size into an allocation
+// block count. Every special file gets at least one block, even an empty
+// one, because a fork with no extent has nowhere to put its B-tree
+// header node. A count that does not fit the uint32 the on-disk fork
+// record uses is an error rather than a wrapped value.
+func forkBlocks(name string, size uint64, blockSize uint32) (uint32, error) {
+	n := DivRoundUp(size, uint64(blockSize))
+	if n == 0 {
+		n = 1
+	}
+	if n > uint64(^uint32(0)) {
+		return 0, fmt.Errorf("hfsplus: %s file needs %d allocation blocks, which exceeds the %d-block maximum",
+			name, n, uint64(^uint32(0)))
+	}
+	return uint32(n), nil
+}
+
 // BuildPlan computes the volume layout from a set of entries, user files,
 // and the sizes of the packed special files (catalog, extents, attributes).
 // The function does not allocate I/O; it just decides offsets.
@@ -81,17 +98,17 @@ func BuildPlan(
 		return nil, fmt.Errorf("hfsplus: blockSize %d must be a power of two >= 512", blockSize)
 	}
 
-	catalogBlocks := uint32(DivRoundUp(catalogTreeSize, uint64(blockSize)))
-	if catalogBlocks == 0 {
-		catalogBlocks = 1
+	catalogBlocks, err := forkBlocks("catalog", catalogTreeSize, blockSize)
+	if err != nil {
+		return nil, err
 	}
-	extentsBlocks := uint32(DivRoundUp(extentsTreeSize, uint64(blockSize)))
-	if extentsBlocks == 0 {
-		extentsBlocks = 1
+	extentsBlocks, err := forkBlocks("extents overflow", extentsTreeSize, blockSize)
+	if err != nil {
+		return nil, err
 	}
-	attrsBlocks := uint32(DivRoundUp(attributesTreeSize, uint64(blockSize)))
-	if attrsBlocks == 0 {
-		attrsBlocks = 1
+	attrsBlocks, err := forkBlocks("attributes", attributesTreeSize, blockSize)
+	if err != nil {
+		return nil, err
 	}
 
 	// Compute per-file block counts and total user data blocks.
@@ -103,32 +120,19 @@ func BuildPlan(
 	// 0xFFFFFFFF blocks (~16 TiB at 4 KiB blocks). Reject anything
 	// over that explicitly so the contract is visible.
 	placements := make([]FilePlacement, len(files))
-	var userBlocks uint32
+	// Summed as a uint64: a set of files whose block counts together
+	// exceed a uint32 has to be an error, not a wrapped total that
+	// silently lays every file on top of the volume header.
+	var userBlocks uint64
 	for i, f := range files {
 		blks64 := DivRoundUp(f.Size, uint64(blockSize))
 		if blks64 > uint64(^uint32(0)) {
 			return nil, fmt.Errorf("hfsplus: file size %d (%d blocks) exceeds single-extent maximum %d blocks",
 				f.Size, blks64, ^uint32(0))
 		}
-		blks := uint32(blks64)
-		placements[i].Blocks = blks
-		userBlocks += blks
+		placements[i].Blocks = uint32(blks64)
+		userBlocks += blks64
 	}
-
-	// Block 0 is reserved (boot + primary VH).
-	// One trailing block is reserved (alternate VH).
-	// Allocation bitmap size depends on totalBlocks, so we iterate.
-	allocBlocks := uint32(1)
-	for {
-		total := uint32(1) + allocBlocks + catalogBlocks + extentsBlocks + attrsBlocks + userBlocks + 1
-		need := uint32(DivRoundUp(uint64(total), uint64(blockSize)*8))
-		if need <= allocBlocks {
-			break
-		}
-		allocBlocks = need
-	}
-
-	totalBlocks := uint32(1) + allocBlocks + catalogBlocks + extentsBlocks + attrsBlocks + userBlocks + 1
 
 	// fsck_hfs caps each B-tree fork's clumpSize at totalBlocks/4 *
 	// blockSize ("max clump = 1/4 volume size", SVerify1.c). For tiny
@@ -136,16 +140,45 @@ func BuildPlan(
 	// force fsck to fall back to a smaller fcbClumpSize and then complain
 	// that VH.<fork>.clumpSize doesn't match. Pad the trailing free
 	// region so totalBlocks >= 4*max(btree fork blocks).
-	maxBTreeBlocks := catalogBlocks
-	if extentsBlocks > maxBTreeBlocks {
-		maxBTreeBlocks = extentsBlocks
+	maxBTreeBlocks := uint64(catalogBlocks)
+	if uint64(extentsBlocks) > maxBTreeBlocks {
+		maxBTreeBlocks = uint64(extentsBlocks)
 	}
-	if attrsBlocks > maxBTreeBlocks {
-		maxBTreeBlocks = attrsBlocks
+	if uint64(attrsBlocks) > maxBTreeBlocks {
+		maxBTreeBlocks = uint64(attrsBlocks)
 	}
-	if minTotal := 4 * maxBTreeBlocks; totalBlocks < minTotal {
-		totalBlocks = minTotal
+	minTotal := 4 * maxBTreeBlocks
+
+	// Block 0 is reserved (boot + primary VH).
+	// One trailing block is reserved (alternate VH).
+	//
+	// The allocation bitmap lives inside the volume it describes, so its
+	// size feeds back into the total and we iterate to a fixed point.
+	// The clump-size pad has to be applied INSIDE that loop: growing the
+	// volume after the bitmap is sized leaves the bitmap too small for
+	// it, and the surplus bytes then overrun the fork into the catalog.
+	// https://github.com/JetBrains/go-dmg-writer/wiki/HFS+-Format
+	allocBlocks64 := uint64(1)
+	var totalBlocks64 uint64
+	for {
+		total := 1 + allocBlocks64 + uint64(catalogBlocks) + uint64(extentsBlocks) +
+			uint64(attrsBlocks) + userBlocks + 1
+		if total < minTotal {
+			total = minTotal
+		}
+		need := DivRoundUp(total, uint64(blockSize)*8)
+		if need <= allocBlocks64 {
+			totalBlocks64 = total
+			break
+		}
+		allocBlocks64 = need
 	}
+	if totalBlocks64 > uint64(^uint32(0)) {
+		return nil, fmt.Errorf("hfsplus: volume needs %d allocation blocks of %d bytes, which exceeds the %d-block maximum of an HFS+ volume",
+			totalBlocks64, blockSize, uint64(^uint32(0)))
+	}
+	totalBlocks := uint32(totalBlocks64)
+	allocBlocks := uint32(allocBlocks64)
 
 	allocStart := uint32(1)
 	catStart := allocStart + allocBlocks
@@ -166,7 +199,7 @@ func BuildPlan(
 	}
 
 	// Build the allocation bitmap: every block used except the user-data
-	// region beyond `cursor` (none in our packed layout — we touch every
+	// region beyond `cursor` (none in our packed layout - we touch every
 	// block from 0 up to and including the trailing alt-VH block).
 	bm := NewAllocationBitmap(totalBlocks)
 	bm.MarkUsed(0, 1)                    // boot + primary VH
