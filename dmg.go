@@ -144,14 +144,21 @@ type DMG struct {
 	//
 	// The map costs 37 KiB of mostly zero sectors, which compress away.
 	//
+	// It also renames the blkx resources: a map-less image has one
+	// called "<VolumeName> (Apple_HFSX : 1)", a framed one has a span
+	// each and the payload's is "disk image (Apple_HFSX : 4)" whatever
+	// VolumeName says, because that is the partition's name rather than
+	// a volume label. `hdiutil` does the same. VolumeName still reaches
+	// Finder either way, from the root folder's catalog record. See
+	// https://github.com/JetBrains/go-dmg-writer/wiki/UDIF-Format
+	//
 	// The two GUIDs the map needs (one for the disk, one for the
 	// partition) come from a hash of the volume name, [DMG.Time] and
-	// the volume size. A random GUID would make the output
-	// differ between two runs of the same input. The trade-off is that
-	// two images built from those same three values carry the same
-	// GUIDs. macOS does not care, but a tool that treats a partition
-	// GUID as unique between disks does. Give the images different
-	// names or different times if that matters to you.
+	// the volume size, so that two runs of one input agree. The
+	// trade-off is that two images built from those same three values
+	// carry the same GUIDs. macOS does not care, but a tool that treats
+	// a partition GUID as unique between disks does; give the images
+	// different names or different times if that matters to you.
 	PartitionMap bool
 }
 
