@@ -1,6 +1,7 @@
 package hfsplus
 
 import (
+	"errors"
 	"fmt"
 	"io"
 )
@@ -217,12 +218,27 @@ func streamFileAt(out io.WriteSeeker, off int64, opener FileOpener, size uint64)
 	if _, err := out.Seek(off, io.SeekStart); err != nil {
 		return err
 	}
+	// The extent of this file was sized from the length the walk saw,
+	// so exactly `size` bytes have to be available now. A file that
+	// changed since then does not fit the volume that was planned around
+	// it, and either half of that has to be an error.
 	written, err := io.CopyN(out, rc, int64(size))
+	if errors.Is(err, io.EOF) || (err == nil && uint64(written) != size) {
+		return fmt.Errorf("file shrank while the image was being built: read %d of %d bytes", written, size)
+	}
 	if err != nil {
 		return err
 	}
-	if uint64(written) != size {
-		return fmt.Errorf("short file: wrote %d of %d bytes", written, size)
+	// io.CopyN stops at `size` and reports success no mater if the
+	// source has more, so a file that grew would be truncated into the
+	// image silently. One more read tells the two apart.
+	var probe [1]byte
+	switch _, err := io.ReadFull(rc, probe[:]); {
+	case errors.Is(err, io.EOF):
+		return nil
+	case err == nil:
+		return fmt.Errorf("file grew while the image was being built: longer than the planned %d bytes", size)
+	default:
+		return err
 	}
-	return nil
 }
