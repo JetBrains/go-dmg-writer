@@ -851,7 +851,10 @@ func TestCreatePartitionMap(t *testing.T) {
 				{"GPT Header (Primary GPT Header : 1)", 1},
 				{"GPT Partition Data (Primary GPT Table : 2)", gpt.EntryArraySectors},
 				{" (Apple_Free : 3)", gpt.PartitionStartLBA - gpt.FirstUsableLBA},
-				{"disk image (Apple_HFS : 4)", bareSectors},
+				// Apple_HFSX, not Apple_HFS: hdiutil takes this string
+				// from the filesystem rather than the partition type
+				// GUID, and this library always writes HFSX.
+				{"disk image (Apple_HFSX : 4)", bareSectors},
 				{"GPT Partition Data (Backup GPT Table : 5)", gpt.EntryArraySectors},
 				{"GPT Header (Backup GPT Header : 6)", 1},
 			}

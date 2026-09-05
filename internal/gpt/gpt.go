@@ -148,16 +148,18 @@ type Region struct {
 // a volume header and handing it a protective MBR instead.
 //
 // Unlike hdiutil we leave no free gap in front of the backup table
-// because we do not round the disk up to a multiple of 8 sectors. The
-// map is well-formed either way; it just makes our disk 7 sectors
-// shorter for the same volume.
+// because we do not round the disk up to a multiple of 8 sectors, so
+// this is 7 regions where hdiutil emits 8.
 func (l Layout) Regions() []Region {
 	return []Region{
 		{Name: "Protective Master Boot Record", Type: "MBR", Sectors: 1},
 		{Name: "GPT Header", Type: "Primary GPT Header", Sectors: 1},
 		{Name: "GPT Partition Data", Type: "Primary GPT Table", Sectors: EntryArraySectors},
 		{Name: "", Type: "Apple_Free", Sectors: PartitionStartLBA - FirstUsableLBA},
-		{Name: partitionName, Type: "Apple_HFS", Sectors: l.volumeSectors},
+		// Named after the PARTITION, not the volume, and typed from the
+		// filesystem rather than from [AppleHFSTypeGUID]: hence
+		// "disk image" and "Apple_HFSX" regardless of the volume name
+		{Name: partitionName, Type: "Apple_HFSX", Sectors: l.volumeSectors},
 		{Name: "GPT Partition Data", Type: "Backup GPT Table", Sectors: EntryArraySectors},
 		{Name: "GPT Header", Type: "Backup GPT Header", Sectors: 1},
 	}

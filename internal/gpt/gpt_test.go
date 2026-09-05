@@ -80,6 +80,40 @@ func TestDescribesOneAppleHFSPartition(t *testing.T) {
 	}
 }
 
+// TestRegionsDescribeTheWholeDisk: the region list is the other half of
+// the framing, and the UDIF resource fork takes it at face value. The
+// counts have to add up to the disk the two maps describe, and the names
+// have to be the ones `hdiutil` writes, since a reader that parses the
+// image instead of mounting it starts here.
+func TestRegionsDescribeTheWholeDisk(t *testing.T) {
+	const volumeSectors = 2048
+	layout := mustNew(t, volumeSectors*SectorSize, "Air", testTime)
+
+	var total uint64
+	for _, r := range layout.Regions() {
+		if r.Sectors == 0 {
+			t.Errorf("region %q (%s) covers no sectors", r.Name, r.Type)
+		}
+		total += r.Sectors
+	}
+	if want := layout.DiskSize() / SectorSize; total != want {
+		t.Errorf("regions cover %d sectors, the disk has %d", total, want)
+	}
+
+	payload := layout.Regions()[4]
+	if payload.Type != "Apple_HFSX" {
+		t.Errorf("payload region type: got %q want %q", payload.Type, "Apple_HFSX")
+	}
+	if payload.Sectors != volumeSectors {
+		t.Errorf("payload region covers %d sectors, the volume has %d", payload.Sectors, volumeSectors)
+	}
+	// The name is the partition's, out of the map, not the volume label
+	// passed to New. hdiutil does the same.
+	if payload.Name != partitionName {
+		t.Errorf("payload region name: got %q want %q", payload.Name, partitionName)
+	}
+}
+
 // TestChecksumsCoverTheHeaderAndTheEntries checks both CRC-32 fields. If
 // either is wrong, macOS falls back to the backup map, or rejects the
 // disk outright.
