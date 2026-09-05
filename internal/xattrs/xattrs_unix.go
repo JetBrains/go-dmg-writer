@@ -1,6 +1,6 @@
 //go:build darwin || linux
 
-package dmg
+package xattrs
 
 import (
 	"errors"
@@ -12,22 +12,23 @@ import (
 	"github.com/jetbrains/go-dmg-writer/internal/hfsplus"
 )
 
-// readXattrs reads every extended attribute on path and returns them as
+// ReadXattrs reads every extended attribute on the path and returns them as
 // [hfsplus.Attr] records keyed by fileID. Uses Llistxattr / Lgetxattr so
 // symlinks report their own xattrs rather than the target's.
 //
 // Policy: every xattr is passed through verbatim, including the
 // `com.apple.system.*` namespace. The macOS notarization pipeline
-// expects this — it relies on `com.apple.quarantine` and friends being
+// expects this - it relies on `com.apple.quarantine` and friends being
 // present on bundle contents. If you need to filter, do it before
 // calling [DMG.Create].
 //
 // Errors:
-//   - ENOTSUP / ENOSYS / "operation not supported" → treated as
-//     "no xattrs on this filesystem", returns (nil, nil).
-//   - ENODATA / ENOATTR → treated as "no xattrs", returns (nil, nil).
+//   - "the filesystem has no xattrs" and "this object has no such
+//     attribute" are both treated as "nothing here" and return
+//     (nil, nil). The exact errnos differ per platform; see
+//     [isNoXattrErr] and noXattrErrnos.
 //   - Anything else (EACCES, EPERM, EIO, ...) is wrapped and returned.
-func readXattrs(path string, fileID uint32) ([]hfsplus.Attr, error) {
+func ReadXattrs(path string, fileID uint32) ([]hfsplus.Attr, error) {
 	names, err := listXattrNames(path)
 	if err != nil {
 		if isNoXattrErr(err) {
@@ -104,7 +105,7 @@ func listXattrNames(path string) ([]string, error) {
 }
 
 // getXattrValue reads one attribute's bytes with the same grow-and-retry
-// pattern as [listXattrNames] so a value growing between probe and read
+// pattern as [listXattrNames], so a value growing between probe and read
 // doesn't truncate.
 func getXattrValue(path, name string) ([]byte, error) {
 	vsz, err := unix.Lgetxattr(path, name, nil)
@@ -136,16 +137,18 @@ func getXattrValue(path, name string) ([]byte, error) {
 }
 
 // isNoXattrErr reports whether err means "this filesystem / object has
-// no extended attributes" — those are legitimate "nothing here"
+// no extended attributes" - those are legitimate "nothing here"
 // signals, distinct from real I/O or permission failures.
+//
+// The set is per-platform ([noXattrErrnos]) because the errno numbers
+// are: Darwin gives ENOATTR, ENODATA, ENOTSUP, and EOPNOTSUPP four
+// distinct values, while Linux has no ENOATTR at all and makes ENOTSUP
+// and EOPNOTSUPP the same number.
 func isNoXattrErr(err error) bool {
-	switch {
-	case errors.Is(err, unix.ENOTSUP):
-		return true
-	case errors.Is(err, unix.ENOSYS):
-		return true
-	case errors.Is(err, unix.ENODATA):
-		return true
+	for _, errno := range noXattrErrnos {
+		if errors.Is(err, errno) {
+			return true
+		}
 	}
 	return false
 }
