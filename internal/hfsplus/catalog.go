@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"sort"
+	"unicode/utf16"
 )
 
 // EntryKind discriminates the three kinds of catalog entry we emit.
@@ -27,7 +28,7 @@ type Entry struct {
 	Kind       EntryKind
 
 	// POSIX bits.
-	Mode    uint16 // file mode bits (chmod) — type bits should be set too
+	Mode    uint16 // file mode bits (chmod) - type bits should be set too
 	OwnerID uint32
 	GroupID uint32
 
@@ -87,10 +88,24 @@ func BuildCatalogTree(entries []*Entry, nodeSize uint16) (*BuildResult, error) {
 	if nodeSize == 0 {
 		nodeSize = 4096
 	}
-	records := buildCatalogRecords(entries)
+	records, err := buildCatalogRecords(entries)
+	if err != nil {
+		return nil, err
+	}
 	sort.Slice(records, func(i, j int) bool {
 		return compareCatalogKeys(records[i].Key, records[j].Key) < 0
 	})
+	// Two equal keys make a corrupt catalog, and since sort.Slice is not
+	// stable they also make the output non-deterministic. They arise
+	// from names that differ before NFD and match after it; dmg.walk
+	// catches those earlier, where it can still name both source paths.
+	for i := 1; i < len(records); i++ {
+		if compareCatalogKeys(records[i-1].Key, records[i].Key) == 0 {
+			parent, name := describeCatalogKey(records[i].Key)
+			return nil, fmt.Errorf("hfsplus: catalog holds two records for name %q under CNID %d",
+				name, parent)
+		}
+	}
 	return BuildTree(records, BuildOpts{
 		NodeSize:       nodeSize,
 		Attributes:     BTBigKeysMask | BTVariableIndexKeys,
@@ -104,7 +119,7 @@ func BuildCatalogTree(entries []*Entry, nodeSize uint16) (*BuildResult, error) {
 // buildCatalogRecords expands every Entry into its pair of catalog records
 // (forward + thread). It does NOT sort; sorting is done in the caller after
 // all records exist.
-func buildCatalogRecords(entries []*Entry) []Record {
+func buildCatalogRecords(entries []*Entry) ([]Record, error) {
 	out := make([]Record, 0, len(entries)*2)
 	for _, e := range entries {
 		// Skip the implicit root parent (CNID 1). It has no catalog entry.
@@ -121,7 +136,7 @@ func buildCatalogRecords(entries []*Entry) []Record {
 		case KindFile, KindSymlink:
 			fwdData = encodeCatalogFileRecord(e)
 		default:
-			panic(fmt.Sprintf("hfsplus: unknown entry kind %d", e.Kind))
+			return nil, fmt.Errorf("hfsplus: entry cnid=%d has unknown kind %d", e.CNID, e.Kind)
 		}
 		out = append(out, Record{Key: fwdKey, Data: fwdData})
 
@@ -130,11 +145,23 @@ func buildCatalogRecords(entries []*Entry) []Record {
 		threadData := encodeThreadRecord(e)
 		out = append(out, Record{Key: threadKey, Data: threadData})
 	}
-	return out
+	return out, nil
+}
+
+// describeCatalogKey decodes a key body back into its parent CNID and a
+// readable name, for error messages.
+func describeCatalogKey(key []byte) (uint32, string) {
+	parent := binary.BigEndian.Uint32(key[0:4])
+	n := int(binary.BigEndian.Uint16(key[4:6]))
+	units := make([]uint16, 0, n)
+	for i := 0; i < n && 6+i*2+2 <= len(key); i++ {
+		units = append(units, binary.BigEndian.Uint16(key[6+i*2:6+i*2+2]))
+	}
+	return parent, string(utf16.Decode(units))
 }
 
 // encodeCatalogKey produces the on-disk key body (without the leading
-// keyLength field — the B-tree packer adds that).
+// keyLength field - the B-tree packer adds that).
 func encodeCatalogKey(parentID uint32, name HFSName) []byte {
 	// 4 (parentID) + 2 (length) + 2*nlen
 	nameBytes := name.Bytes()

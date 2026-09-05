@@ -36,6 +36,54 @@ func TestBuildAttributesTreeOneInline(t *testing.T) {
 	}
 }
 
+// TestBuildAttributesTreeRejectsDuplicateKeys: an attributes key is
+// (fileID, name), and the name goes through the same NFD conversion the
+// catalog uses, so a repeated pair - or two names that match after NFD -
+// makes two equal keys in one tree.
+func TestBuildAttributesTreeRejectsDuplicateKeys(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		attrs []Attr
+	}{
+		{
+			name: "same pair twice",
+			attrs: []Attr{
+				{FileID: 16, Name: "com.apple.quarantine", Data: []byte("a")},
+				{FileID: 16, Name: "com.apple.quarantine", Data: []byte("b")},
+			},
+		},
+		{
+			name: "names equal after NFD",
+			attrs: []Attr{
+				{FileID: 16, Name: "user.caf\u00e9", Data: []byte("a")},
+				{FileID: 16, Name: "user.cafe\u0301", Data: []byte("b")},
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := BuildAttributesTree(tt.attrs); err == nil {
+				t.Error("BuildAttributesTree accepted two records with the same key")
+			}
+		})
+	}
+}
+
+// TestBuildAttributesTreeAllowsSameNameOnDifferentFiles is the guard
+// against over-rejecting: the same xattr on two files is ordinary.
+func TestBuildAttributesTreeAllowsSameNameOnDifferentFiles(t *testing.T) {
+	attrs := []Attr{
+		{FileID: 16, Name: "com.apple.quarantine", Data: []byte("a")},
+		{FileID: 17, Name: "com.apple.quarantine", Data: []byte("b")},
+	}
+	r, err := BuildAttributesTree(attrs)
+	if err != nil {
+		t.Fatalf("BuildAttributesTree: %v", err)
+	}
+	if r.LeafRecords != 2 {
+		t.Errorf("LeafRecords: got %d want 2", r.LeafRecords)
+	}
+}
+
 func TestEncodeAttrKeyShape(t *testing.T) {
 	name, _ := NewName("com.apple.x")
 	k := encodeAttrKey(0xCAFEBABE, 0, name)
