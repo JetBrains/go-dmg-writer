@@ -319,6 +319,58 @@ func TestCreateRootFinderInfoBadSize(t *testing.T) {
 	}
 }
 
+// TestCreateTempDir covers where the scratch volume lands. The default
+// is the output directory rather than TMPDIR, because the scratch file
+// is the whole uncompressed volume and TMPDIR is often small or in RAM.
+func TestCreateTempDir(t *testing.T) {
+	// An explicit TempDir is used, and the scratch file is cleaned up.
+	t.Run("explicit", func(t *testing.T) {
+		src := makeSourceTree(t)
+		scratchDir := t.TempDir()
+		out := filepath.Join(t.TempDir(), "explicit.dmg")
+		d := &DMG{TempDir: scratchDir, Time: time.Unix(1700000000, 0).UTC()}
+		if err := d.Create(src, out, ModeReadOnly); err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+		left, err := os.ReadDir(scratchDir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(left) != 0 {
+			t.Errorf("scratch file left behind in TempDir: %v", left)
+		}
+	})
+
+	// A TempDir that does not exist is a caller error and has to be
+	// reported, not silently swapped for TMPDIR.
+	t.Run("nonexistent", func(t *testing.T) {
+		src := makeSourceTree(t)
+		out := filepath.Join(t.TempDir(), "bad.dmg")
+		d := &DMG{TempDir: filepath.Join(t.TempDir(), "no", "such", "dir")}
+		if err := d.Create(src, out, ModeReadOnly); err == nil {
+			t.Fatal("Create accepted a TempDir that does not exist")
+		}
+	})
+
+	// The default leaves nothing behind in the output directory either.
+	t.Run("default is the output directory", func(t *testing.T) {
+		src := makeSourceTree(t)
+		outDir := t.TempDir()
+		out := filepath.Join(outDir, "default.dmg")
+		d := &DMG{Time: time.Unix(1700000000, 0).UTC()}
+		if err := d.Create(src, out, ModeReadOnly); err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+		ents, err := os.ReadDir(outDir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(ents) != 1 || ents[0].Name() != "default.dmg" {
+			t.Errorf("output directory should hold only the image, got %v", ents)
+		}
+	})
+}
+
 // TestCreateRejectsOversizedVolumeName: the volume name IS the root
 // folder's catalog name, so a name the catalog cannot hold has to fail.
 // It used to be dropped on the floor, producing an image with no volume

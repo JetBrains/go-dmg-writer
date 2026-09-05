@@ -122,6 +122,15 @@ type DMG struct {
 	// prefer the latter.
 	OwnerID uint32
 	GroupID uint32
+	// TempDir is where [DMG.Create] puts the scratch file holding the
+	// uncompressed HFS+ volume while it is being built. It is removed
+	// before Create returns.
+	//
+	// Defaults to the directory of outPath, deliberately rather than to
+	// the system temp directory: the scratch file is the whole volume,
+	// so a 4 GiB source folder needs 4 GiB here, and TMPDIR is often
+	// small or RAM-backed. Set this if you have a better scratch volume.
+	TempDir string
 	// PartitionMap frames the volume in a GUID partition table, so the
 	// image describes a whole disk: a protective MBR, a primary GPT and
 	// its backup copy, with the volume as the single Apple HFS
@@ -205,10 +214,16 @@ func (d *DMG) Create(srcFolder, outPath string, mode Mode) (err error) {
 		})
 	}
 
-	// Build the HFS+ image into a scratch file.
-	scratch, err := os.CreateTemp("", "go-dmg-*.hfs")
+	// Build the HFS+ image into a scratch file. It holds the entire
+	// uncompressed volume, so it goes next to the output rather than in
+	// TMPDIR unless the caller says otherwise; see [DMG.TempDir].
+	tempDir := d.TempDir
+	if tempDir == "" {
+		tempDir = filepath.Dir(outPath)
+	}
+	scratch, err := os.CreateTemp(tempDir, "go-dmg-*.hfs")
 	if err != nil {
-		return fmt.Errorf("dmg: scratch file: %w", err)
+		return fmt.Errorf("dmg: scratch file in %q: %w", tempDir, err)
 	}
 	defer func() {
 		_ = scratch.Close()
