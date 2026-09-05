@@ -16,7 +16,7 @@ import (
 )
 
 // TestHdiutilVerify exercises the produced DMGs against Apple's own
-// `hdiutil verify` tool. A failure here is a release blocker — it means
+// `hdiutil verify` tool. A failure here is a release blocker - it means
 // the DMG would not survive notarization either. We run all three modes.
 //
 // The test is darwin-gated; on Linux/Windows the build tag at the top of

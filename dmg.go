@@ -28,7 +28,7 @@ and may be used inside closed-source applications.
     file, so two hard links pointing at the same inode become two
     catalog entries each with their own copy of the data. For
     read-only distribution DMGs this is benign; if your input contains
-    intentional hard links you should consolidate them before calling
+    intentional hard links, you should consolidate them before calling
     [DMG.Create].
 */
 package dmg
@@ -82,7 +82,7 @@ func (m Mode) String() string {
 // as "ignore stored permissions, use the mounter's identity").
 //
 // The struct's zero value (0) is the legitimate root UID, NOT unset; if
-// you want the unknown-user behavior you must opt in by setting OwnerID
+// you want the unknown-user behavior, you must opt in by setting OwnerID
 // (and/or GroupID) to OwnerIDUnset explicitly.
 const OwnerIDUnset uint32 = ^uint32(0)
 
@@ -146,11 +146,11 @@ type DMG struct {
 	//
 	// It also renames the blkx resources: a map-less image has one
 	// called "<VolumeName> (Apple_HFSX : 1)", a framed one has a span
-	// each and the payload's is "disk image (Apple_HFSX : 4)" whatever
+	// each, and the payload's is "disk image (Apple_HFSX : 4)" whatever
 	// VolumeName says, because that is the partition's name rather than
 	// a volume label. `hdiutil` does the same. VolumeName still reaches
-	// Finder either way, from the root folder's catalog record. See
-	// https://github.com/JetBrains/go-dmg-writer/wiki/UDIF-Format
+	// Finder either way, from the root folder's catalog record.
+	// Refer to the project's Wiki for in-depth information.
 	//
 	// The two GUIDs the map needs (one for the disk, one for the
 	// partition) come from a hash of the volume name, [DMG.Time] and
@@ -405,8 +405,7 @@ func walk(root string, macTime, ownerID, groupID uint32, volumeName string) (*sc
 	// directory that differ only in Unicode composition collapse to one
 	// key, which a catalog cannot hold. Catching it here is what lets
 	// the error name the two paths; the packers check the same
-	// invariant without them. See the wiki, "HFS+ Format":
-	// https://github.com/JetBrains/go-dmg-writer/wiki/HFS+-Format
+	// invariant without them. See the wiki ("HFS+ Format").
 	type dirName struct {
 		parent uint32
 		name   string

@@ -256,8 +256,7 @@ func blkxSpecs(regions []Region, volName string, totalSectors uint64) ([]blkxSpe
 		return []blkxSpec{{
 			// "Apple_HFSX", not "Apple_HFS": the type names the
 			// filesystem, and we always write HFSX. gpt.Layout.Regions
-			// says the same for a framed image; see the wiki:
-			// https://github.com/JetBrains/go-dmg-writer/wiki/UDIF-Format
+			// says the same for a framed image
 			name:       fmt.Sprintf("%s (Apple_HFSX : 1)", volName),
 			id:         0,
 			descriptor: partitionVariantNumber,
@@ -435,9 +434,7 @@ func encodeChunks(
 		// `results` is read to close even after a write failure.
 		// Returning early here deadlocks [Write] instead of reporting
 		// the failure: the workers stay blocked on their sends, so
-		// nothing ever closes `results`. See "Failure handling in the
-		// parallel pipeline" on the wiki:
-		// https://github.com/JetBrains/go-dmg-writer/wiki/Architecture
+		// nothing ever closes `results`.
 		for r := range results {
 			if writeErr != nil {
 				continue // discard; we are only here to unblock the workers
@@ -554,7 +551,7 @@ producer:
 }
 
 // trySendErr is a non-blocking send onto a buffered errCh; if the
-// channel is already full (another worker reported first) we just drop
+// channel is already full (another worker reported first), we just drop
 // the duplicate so the goroutine can exit promptly.
 func trySendErr(ch chan<- error, err error) {
 	select {

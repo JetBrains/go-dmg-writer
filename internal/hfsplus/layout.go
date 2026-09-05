@@ -153,11 +153,10 @@ func BuildPlan(
 	// One trailing block is reserved (alternate VH).
 	//
 	// The allocation bitmap lives inside the volume it describes, so its
-	// size feeds back into the total and we iterate to a fixed point.
+	// size feeds back into the total, and we iterate to a fixed point.
 	// The clump-size pad has to be applied INSIDE that loop: growing the
 	// volume after the bitmap is sized leaves the bitmap too small for
-	// it, and the surplus bytes then overrun the fork into the catalog.
-	// https://github.com/JetBrains/go-dmg-writer/wiki/HFS+-Format
+	// it, and the surplus bytes then overrun the fork into the catalog
 	allocBlocks64 := uint64(1)
 	var totalBlocks64 uint64
 	for {
@@ -239,16 +238,11 @@ func BuildPlan(
 	// names actually use, because on HFSX the per-record TextEncoding
 	// field is authoritative. We do the same: bit 0 is always set,
 	// other bits are always clear.
-	//
-	// (An earlier revision OR'd `1 << e.TextEncodingHint()` per entry,
-	// but TextEncodingHint returns the encoding NUMBER (0 or 0x7F),
-	// not a bit position; `1 << 0x7F` on a uint64 is 0 anyway, so the
-	// expression was a no-op for non-ASCII names.)
 	const encodings uint64 = 1
 
 	// NextAllocation points at the first free block (first block past
 	// the user-data region). For a packed layout with padding this is
-	// `cursor`; if the cursor happens to land on the alt-VH block it wraps
+	// `cursor`; if the cursor happens to land on the alt-VH block, it wraps
 	// to zero per TN1150 ("undefined" but conventionally 0).
 	nextAlloc := cursor
 	if nextAlloc >= totalBlocks-1 {

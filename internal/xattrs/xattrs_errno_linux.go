@@ -6,8 +6,7 @@ import "golang.org/x/sys/unix"
 // as opposed to a real failure. It is shorter than the Darwin list
 // because EOPNOTSUPP is the same number as ENOTSUP (95) here, and
 // because ENOATTR - glibc's name for ENODATA (61) - has no constant on
-// Linux in golang.org/x/sys/unix. The table is on the wiki:
-// https://github.com/JetBrains/go-dmg-writer/wiki/Architecture
+// Linux in golang.org/x/sys/unix.
 var noXattrErrnos = []error{
 	unix.ENOTSUP,
 	unix.ENOSYS,
