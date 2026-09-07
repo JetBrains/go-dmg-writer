@@ -191,7 +191,12 @@ func BuildPlan(
 		placements[i].StartBlock = cursor
 		// Update the entry's data fork now so the catalog packer sees
 		// the real extent value before writing.
-		f.Entry.DataExtents = LogicalToExtent(cursor, placements[i].Blocks)
+		if placements[i].Blocks == 0 {
+			placements[i].StartBlock = 0
+			f.Entry.DataExtents = ExtentRecord{}
+		} else {
+			f.Entry.DataExtents = LogicalToExtent(cursor, placements[i].Blocks)
+		}
 		f.Entry.DataTotalBlocks = placements[i].Blocks
 		f.Entry.DataLogicalSize = f.Size
 		cursor += placements[i].Blocks
