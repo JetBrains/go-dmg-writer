@@ -66,7 +66,7 @@ func TestHdiutilVerify(t *testing.T) {
 // structural bugs that hdiutil verify accepts (because verify only
 // checks the UDIF checksum, not the inner HFS+ tree).
 //
-// We use /dev/diskN (not /dev/rdiskN) so fsck_hfs doesn't require root.
+// We use /dev/diskN (not /dev/rdiskN), so fsck_hfs doesn't require root.
 func TestFsckHFS(t *testing.T) {
 	hdiutil, err := exec.LookPath("hdiutil")
 	if err != nil {
@@ -257,6 +257,9 @@ func makeSourceTreeWithSymlink(t *testing.T) string {
 	// those sectors out. A checksum that counts them makes verify
 	// report INVALID, and nothing else in the suite sees a difference.
 	mustWrite(t, filepath.Join(root, "hole.bin"), string(make([]byte, 6*1024*1024)))
+
+	// just a regular empty file
+	mustWrite(t, filepath.Join(root, "empty.txt"), "")
 	return root
 }
 
