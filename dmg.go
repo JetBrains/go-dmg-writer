@@ -28,7 +28,7 @@ and may be used inside closed-source applications.
     file, so two hard links pointing at the same inode become two
     catalog entries each with their own copy of the data. For
     read-only distribution DMGs this is benign; if your input contains
-    intentional hard links you should consolidate them before calling
+    intentional hard links, you should consolidate them before calling
     [DMG.Create].
 */
 package dmg
@@ -45,6 +45,7 @@ import (
 	"github.com/jetbrains/go-dmg-writer/internal/gpt"
 	"github.com/jetbrains/go-dmg-writer/internal/hfsplus"
 	"github.com/jetbrains/go-dmg-writer/internal/udif"
+	"github.com/jetbrains/go-dmg-writer/internal/xattrs"
 )
 
 // Mode selects how the produced DMG encodes its data fork.
@@ -81,7 +82,7 @@ func (m Mode) String() string {
 // as "ignore stored permissions, use the mounter's identity").
 //
 // The struct's zero value (0) is the legitimate root UID, NOT unset; if
-// you want the unknown-user behavior you must opt in by setting OwnerID
+// you want the unknown-user behavior, you must opt in by setting OwnerID
 // (and/or GroupID) to OwnerIDUnset explicitly.
 const OwnerIDUnset uint32 = ^uint32(0)
 
@@ -121,6 +122,15 @@ type DMG struct {
 	// prefer the latter.
 	OwnerID uint32
 	GroupID uint32
+	// TempDir is where [DMG.Create] puts the scratch file holding the
+	// uncompressed HFS+ volume while it is being built. It is removed
+	// before Create returns.
+	//
+	// Defaults to the directory of outPath, deliberately rather than to
+	// the system temp directory: the scratch file is the whole volume,
+	// so a 4 GiB source folder needs 4 GiB here, and TMPDIR is often
+	// small or RAM-backed. Set this if you have a better scratch volume.
+	TempDir string
 	// PartitionMap frames the volume in a GUID partition table, so the
 	// image describes a whole disk: a protective MBR, a primary GPT and
 	// its backup copy, with the volume as the single Apple HFS
@@ -133,6 +143,22 @@ type DMG struct {
 	// because it starts at the partition map and has nowhere to go.
 	//
 	// The map costs 37 KiB of mostly zero sectors, which compress away.
+	//
+	// It also renames the blkx resources: a map-less image has one
+	// called "<VolumeName> (Apple_HFSX : 1)", a framed one has a span
+	// each, and the payload's is "disk image (Apple_HFSX : 4)" whatever
+	// VolumeName says, because that is the partition's name rather than
+	// a volume label. `hdiutil` does the same. VolumeName still reaches
+	// Finder either way, from the root folder's catalog record.
+	// Refer to the project's Wiki for in-depth information.
+	//
+	// The two GUIDs the map needs (one for the disk, one for the
+	// partition) come from a hash of the volume name, [DMG.Time] and
+	// the volume size, so that two runs of one input agree. The
+	// trade-off is that two images built from those same three values
+	// carry the same GUIDs. macOS does not care, but a tool that treats
+	// a partition GUID as unique between disks does; give the images
+	// different names or different times if that matters to you.
 	PartitionMap bool
 }
 
@@ -183,7 +209,7 @@ func (d *DMG) Create(srcFolder, outPath string, mode Mode) (err error) {
 		return err
 	}
 
-	// Optionally attach RootFinderInfo as an xattr on the root folder.
+	// Optionally, attach RootFinderInfo as a xattr on the root folder.
 	if d.RootFinderInfo != nil {
 		if got := len(d.RootFinderInfo); got != 32 {
 			return fmt.Errorf("dmg: RootFinderInfo must be exactly 32 bytes (got %d)", got)
@@ -195,10 +221,16 @@ func (d *DMG) Create(srcFolder, outPath string, mode Mode) (err error) {
 		})
 	}
 
-	// Build the HFS+ image into a scratch file.
-	scratch, err := os.CreateTemp("", "go-dmg-*.hfs")
+	// Build the HFS+ image into a scratch file. It holds the entire
+	// uncompressed volume, so it goes next to the output rather than in
+	// TMPDIR unless the caller says otherwise; see [DMG.TempDir].
+	tempDir := d.TempDir
+	if tempDir == "" {
+		tempDir = filepath.Dir(outPath)
+	}
+	scratch, err := os.CreateTemp(tempDir, "go-dmg-*.hfs")
 	if err != nil {
-		return fmt.Errorf("dmg: scratch file: %w", err)
+		return fmt.Errorf("dmg: scratch file in %q: %w", tempDir, err)
 	}
 	defer func() {
 		_ = scratch.Close()
@@ -271,6 +303,18 @@ func (d *DMG) Create(srcFolder, outPath string, mode Mode) (err error) {
 	if d.PartitionMap {
 		src = io.MultiReader(bytes.NewReader(layout.LeadingMap()), src, bytes.NewReader(layout.TrailingMap()))
 		srcLen = int64(layout.DiskSize())
+
+		// The resource fork has to describe the framed disk span by
+		// span. Without this the image carries one blkx table that
+		// calls the whole disk a filesystem, and a reader that trusts
+		// it starts reading the protective MBR as a volume header.
+		for _, r := range layout.Regions() {
+			udifOpts.Regions = append(udifOpts.Regions, udif.Region{
+				Name:        r.Name,
+				Type:        r.Type,
+				SectorCount: r.Sectors,
+			})
+		}
 	}
 
 	if err := udif.Write(out, src, srcLen, udifOpts); err != nil {
@@ -294,10 +338,13 @@ func walk(root string, macTime, ownerID, groupID uint32, volumeName string) (*sc
 	parentMap[root] = hfsplus.CNIDRootFolder
 
 	// Root folder entry. The root's name IS the volume name: HFS+/HFSX
-	// don't have a separate "volume label" field, the volume name field
-	// in the volume header is literally the name on the root folder's
-	// catalog record.
-	rootEntry := newFolderEntry(hfsplus.CNIDRootFolder, hfsplus.CNIDRootParent, volumeName, macTime, ownerID, groupID, 0o755)
+	// have no separate volume-label field, so a name the catalog cannot
+	// hold has to fail here rather than ship a volume with no name.
+	rootName, err := hfsplus.NewName(volumeName)
+	if err != nil {
+		return nil, fmt.Errorf("dmg: volume name %q: %w", volumeName, err)
+	}
+	rootEntry := newFolderEntry(hfsplus.CNIDRootFolder, hfsplus.CNIDRootParent, rootName, macTime, ownerID, groupID, 0o755)
 	out.entries = append(out.entries, rootEntry)
 
 	nextCNID := hfsplus.CNIDFirstUser
@@ -351,15 +398,31 @@ func walk(root string, macTime, ownerID, groupID uint32, volumeName string) (*sc
 		return nil, walkErr
 	}
 
-	// Pass 2: materialise Entry / UserFileInput / Attr lists.
+	// Pass 2: materialize Entry / UserFileInput / Attr lists.
 	valence := map[uint32]uint32{}
 	subFolderCount := map[uint32]uint32{}
+	// A catalog key is (parent CNID, NFD name), so two names in one
+	// directory that differ only in Unicode composition collapse to one
+	// key, which a catalog cannot hold. Catching it here is what lets
+	// the error name the two paths; the packers check the same
+	// invariant without them. See the wiki ("HFS+ Format").
+	type dirName struct {
+		parent uint32
+		name   string
+	}
+	claimed := make(map[dirName]string, len(pending))
 	for _, p := range pending {
 		base := filepath.Base(p.path)
 		name, err := hfsplus.NewName(base)
 		if err != nil {
 			return nil, fmt.Errorf("dmg: name %q: %w", base, err)
 		}
+		key := dirName{parent: p.parent, name: string(name.Bytes())}
+		if first, dup := claimed[key]; dup {
+			return nil, fmt.Errorf("dmg: %q and %q normalize to the same HFS+ name %q; "+
+				"a catalog cannot hold both, rename one of them", first, p.path, base)
+		}
+		claimed[key] = p.path
 		valence[p.parent]++
 
 		switch {
@@ -397,11 +460,10 @@ func walk(root string, macTime, ownerID, groupID uint32, volumeName string) (*sc
 			})
 
 		case p.info.IsDir():
-			entry := newFolderEntry(p.cnid, p.parent, base, macTime, ownerID, groupID, modeBits(p.info))
-			entry.Name = name
+			entry := newFolderEntry(p.cnid, p.parent, name, macTime, ownerID, groupID, modeBits(p.info))
 			subFolderCount[p.parent]++
 			out.entries = append(out.entries, entry)
-			attrs, err := readXattrs(p.path, p.cnid)
+			attrs, err := xattrs.ReadXattrs(p.path, p.cnid)
 			if err != nil {
 				return nil, err
 			}
@@ -432,7 +494,7 @@ func walk(root string, macTime, ownerID, groupID uint32, volumeName string) (*sc
 					return os.Open(path)
 				},
 			})
-			attrs, err := readXattrs(p.path, p.cnid)
+			attrs, err := xattrs.ReadXattrs(p.path, p.cnid)
 			if err != nil {
 				return nil, err
 			}
@@ -440,8 +502,8 @@ func walk(root string, macTime, ownerID, groupID uint32, volumeName string) (*sc
 		}
 	}
 
-	// Backfill folder counters (valence + sub-folder count) for every
-	// folder including the root.
+	// Backfill folder counters (valence + subfolder count) for every
+	// folder, including the root.
 	for _, e := range out.entries {
 		if e.Kind == hfsplus.KindFolder {
 			e.Valence = valence[e.CNID]
@@ -510,8 +572,8 @@ const (
 )
 
 func modeBits(info os.FileInfo) uint16 {
-	// Strip non-permission bits from the Go FileMode; the type bits are
-	// added by the caller via `bitwise-or`.
+	// Strip non-permission bits from the Go FileMode; the caller
+	// adds the type bits via `bitwise-or`.
 	//
 	// Note: on Windows os.FileMode.Perm()
 	// returns synthetic 0o666/0o777 values rather than real POSIX
@@ -520,12 +582,15 @@ func modeBits(info os.FileInfo) uint16 {
 	return uint16(info.Mode().Perm())
 }
 
-func newFolderEntry(cnid, parent uint32, name string, macTime, ownerID, groupID uint32, mode uint16) *hfsplus.Entry {
-	n, _ := hfsplus.NewName(name)
+// newFolderEntry takes an already-converted [hfsplus.HFSName] rather
+// than a string: the conversion can fail (a name over 255 UTF-16 code
+// units), and a constructor that cannot report that failure would have
+// to swallow it and hand back a folder with no name.
+func newFolderEntry(cnid, parent uint32, name hfsplus.HFSName, macTime, ownerID, groupID uint32, mode uint16) *hfsplus.Entry {
 	return &hfsplus.Entry{
 		CNID:             cnid,
 		ParentCNID:       parent,
-		Name:             n,
+		Name:             name,
 		Kind:             hfsplus.KindFolder,
 		Mode:             mode | dirTypeBits,
 		OwnerID:          ownerID,

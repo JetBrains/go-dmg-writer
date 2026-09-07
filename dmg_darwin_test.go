@@ -16,7 +16,7 @@ import (
 )
 
 // TestHdiutilVerify exercises the produced DMGs against Apple's own
-// `hdiutil verify` tool. A failure here is a release blocker — it means
+// `hdiutil verify` tool. A failure here is a release blocker - it means
 // the DMG would not survive notarization either. We run all three modes.
 //
 // The test is darwin-gated; on Linux/Windows the build tag at the top of
@@ -86,41 +86,33 @@ func TestFsckHFS(t *testing.T) {
 
 	attach := exec.Command(hdiutil, "attach", "-nobrowse", "-nomount", "-readonly", out)
 	combined, err := attach.CombinedOutput()
-	if err != nil {
-		t.Fatalf("hdiutil attach -nomount failed: %v\n%s", err, combined)
-	}
-	// We emit a *partitionless* DMG (the raw HFS+ volume occupies the
-	// whole data fork), so hdiutil's output looks like:
-	//   /dev/diskN          <tab><empty type><tab><empty name>
-	// rather than the usual GPT-with-Apple_HFS layout. Pick the first
-	// /dev/diskN entry and run fsck against it directly.
-	var hfsDev, rootDev string
+	// This image is *partitionless*: the raw HFS+ volume fills the whole
+	// data fork, so hdiutil reports one node with no type and no name:
+	//   /dev/diskN <tab> <empty type><tab><empty name>
+	// That one node is both the whole disk and the volume, so fsck and
+	// detach both get it. A framed image reads back differently; see
+	// TestPartitionMapAttachAndFsck.
+	var dev string
 	for _, line := range strings.Split(string(combined), "\n") {
 		f := strings.Fields(line)
 		if len(f) >= 1 && strings.HasPrefix(f[0], "/dev/disk") {
-			hfsDev = f[0]
-			rootDev = f[0]
-			// If we ever switch to a partitioned layout, prefer
-			// the Apple_HFS / Apple_HFSX child.
-			if len(f) >= 2 && (strings.HasPrefix(f[1], "Apple_HFS") || strings.HasPrefix(f[1], "Apple_HFSX")) {
-				hfsDev = f[0]
-				rootDev = strings.TrimRight(f[0], "0123456789")
-				rootDev = strings.TrimSuffix(rootDev, "s")
-				break
-			}
+			dev = f[0]
+			break
 		}
 	}
 	defer func() {
-		if rootDev != "" {
-			detach := exec.Command(hdiutil, "detach", rootDev, "-force")
-			_ = detach.Run()
+		if dev != "" {
+			_ = exec.Command(hdiutil, "detach", dev, "-force").Run()
 		}
 	}()
-	if hfsDev == "" {
+	if err != nil {
+		t.Fatalf("hdiutil attach -nomount failed: %v\n%s", err, combined)
+	}
+	if dev == "" {
 		t.Fatalf("no /dev/disk entry in hdiutil output:\n%s", combined)
 	}
 
-	cmd := exec.Command(fsck, "-fnd", hfsDev)
+	cmd := exec.Command(fsck, "-fnd", dev)
 	out2, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("fsck_hfs failed: %v\noutput:\n%s", err, out2)
@@ -161,13 +153,14 @@ func mountAndCompare(t *testing.T, partitionMap bool) {
 		t.Fatal(err)
 	}
 	attach := exec.Command(hdiutil, "attach", "-nobrowse", "-mountpoint", mountPoint, out)
-	if combined, err := attach.CombinedOutput(); err != nil {
-		t.Fatalf("hdiutil attach failed: %v\noutput:\n%s", err, combined)
-	}
+	combined, err := attach.CombinedOutput()
 	defer func() {
 		detach := exec.Command(hdiutil, "detach", mountPoint, "-force")
 		_ = detach.Run()
 	}()
+	if err != nil {
+		t.Fatalf("hdiutil attach failed: %v\noutput:\n%s", err, combined)
+	}
 
 	// Compare the two trees by walking source and looking up each
 	// path under mountPoint.
@@ -209,9 +202,6 @@ func TestPartitionMapAttachAndFsck(t *testing.T) {
 
 	attach := exec.Command(hdiutil, "attach", "-nobrowse", "-nomount", "-readonly", out)
 	combined, err := attach.CombinedOutput()
-	if err != nil {
-		t.Fatalf("hdiutil attach -nomount failed: %v\n%s", err, combined)
-	}
 	// A framed image attaches the way a real disk does: the whole-disk
 	// node carries the GPT scheme, and the payload is a child slice
 	// typed Apple_HFS.
@@ -233,6 +223,9 @@ func TestPartitionMapAttachAndFsck(t *testing.T) {
 			_ = exec.Command(hdiutil, "detach", rootDev, "-force").Run()
 		}
 	}()
+	if err != nil {
+		t.Fatalf("hdiutil attach -nomount failed: %v\n%s", err, combined)
+	}
 	if !strings.Contains(string(combined), "GUID_partition_scheme") {
 		t.Errorf("hdiutil did not read a GUID partition scheme back:\n%s", combined)
 	}
@@ -259,6 +252,11 @@ func makeSourceTreeWithSymlink(t *testing.T) string {
 		t.Fatal(err)
 	}
 	mustWrite(t, filepath.Join(root, "café.txt"), "non-ascii name\n")
+	// Several chunks of zeros, so the writer emits BlockZero runs and
+	// `hdiutil verify` gets to check that the table checksums leave
+	// those sectors out. A checksum that counts them makes verify
+	// report INVALID, and nothing else in the suite sees a difference.
+	mustWrite(t, filepath.Join(root, "hole.bin"), string(make([]byte, 6*1024*1024)))
 	return root
 }
 
@@ -272,15 +270,15 @@ func walkTree(root string) (string, error) {
 		if rel == "" {
 			return nil
 		}
-		// macOS auto-mounts add some hidden files (.fseventsd, .Trashes,
-		// .Spotlight-V100) that aren't in the source. Skip them.
+		// macOS auto-mounts add some hidden files (`.fseventsd`, `.Trashes`,
+		// `.Spotlight-V100`) that aren't in the source. Skip them.
 		if strings.HasPrefix(filepath.Base(rel), ".") {
 			if info.IsDir() {
 				return filepath.SkipDir
 			}
 			return nil
 		}
-		// For directories we deliberately ignore the "size" field
+		// For directories, we deliberately ignore the "size" field
 		// because macOS reports the on-disk catalog metadata size,
 		// which has nothing to do with the source folder's size on
 		// the host filesystem.
@@ -293,7 +291,7 @@ func walkTree(root string) (string, error) {
 			typ = "l"
 		}
 		// HFS+ stores filenames in NFD; APFS (the typical source
-		// filesystem on modern macs) leaves them as the bytes given.
+		// filesystem on modern Macs) leaves them as the bytes given.
 		// Normalize both sides to NFC for comparison.
 		fmt.Fprintf(&b, "%s %s %d\n", typ, norm.NFC.String(rel), size)
 		return nil

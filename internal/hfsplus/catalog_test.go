@@ -20,7 +20,7 @@ func TestCatalogKeyOrdering(t *testing.T) {
 }
 
 func TestCatalogThreadKey(t *testing.T) {
-	// Thread record key is (cnid, "") — should sort before any forward
+	// Thread record key is (cnid, "") - should sort before any forward
 	// record under the same parent (because empty name < anything).
 	thr := encodeCatalogKey(5, HFSName{})
 	fwd := encodeCatalogKey(5, mustName(t, "anything"))
@@ -68,6 +68,54 @@ func TestBuildCatalogTreeSmall(t *testing.T) {
 	}
 	if r.TreeDepth != 1 {
 		t.Errorf("TreeDepth: got %d want 1", r.TreeDepth)
+	}
+}
+
+// TestBuildCatalogTreeRejectsDuplicateKeys: NewName applies NFD, so two
+// source names that differ only in composition produce one catalog key.
+// A tree with two equal keys is corrupt, and because sort.Slice is not
+// stable their order can also change between runs. Both spellings below
+// are distinct Go string literals and one NFD form.
+func TestBuildCatalogTreeRejectsDuplicateKeys(t *testing.T) {
+	root := &Entry{
+		CNID: CNIDRootFolder, ParentCNID: CNIDRootParent, Kind: KindFolder, Valence: 2,
+		CreateTime: 1, ContentModTime: 1, AttributeModTime: 1, AccessTime: 1, BackupTime: 1,
+	}
+	mk := func(cnid uint32, name string) *Entry {
+		return &Entry{
+			CNID: cnid, ParentCNID: CNIDRootFolder, Name: mustName(t, name), Kind: KindFile,
+			CreateTime: 1, ContentModTime: 1, AttributeModTime: 1, AccessTime: 1, BackupTime: 1,
+		}
+	}
+	entries := []*Entry{
+		root,
+		mk(CNIDFirstUser, "caf\u00e9.txt"),    // é as U+00E9
+		mk(CNIDFirstUser+1, "cafe\u0301.txt"), // e + U+0301
+	}
+	if _, err := BuildCatalogTree(entries, 4096); err == nil {
+		t.Fatal("BuildCatalogTree accepted two entries with the same catalog key")
+	}
+}
+
+// TestBuildCatalogTreeRejectsUnknownKind: an out-of-range EntryKind used
+// to panic out of a library function that already returns an error.
+func TestBuildCatalogTreeRejectsUnknownKind(t *testing.T) {
+	root := &Entry{
+		CNID: CNIDRootFolder, ParentCNID: CNIDRootParent, Kind: KindFolder,
+		CreateTime: 1, ContentModTime: 1, AttributeModTime: 1, AccessTime: 1, BackupTime: 1,
+	}
+	bogus := &Entry{
+		CNID: CNIDFirstUser, ParentCNID: CNIDRootFolder, Name: mustName(t, "x"),
+		Kind:       EntryKind(99),
+		CreateTime: 1, ContentModTime: 1, AttributeModTime: 1, AccessTime: 1, BackupTime: 1,
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("BuildCatalogTree panicked instead of returning an error: %v", r)
+		}
+	}()
+	if _, err := BuildCatalogTree([]*Entry{root, bogus}, 4096); err == nil {
+		t.Fatal("BuildCatalogTree accepted an entry with an unknown kind")
 	}
 }
 

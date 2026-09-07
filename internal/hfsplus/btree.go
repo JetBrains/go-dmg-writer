@@ -56,8 +56,40 @@ type BuildResult struct {
 	// FreeNodes is the number of allocated but unused nodes.
 	FreeNodes uint32
 
+	// mapCoverage is how many node bits the allocation map can describe:
+	// the header node's map record plus whatever map nodes the tree
+	// allocated. PadToBlocks refuses to grow TotalNodes past it, because
+	// a node the map cannot describe reads as free.
+	mapCoverage uint32
+
 	// Stored opts so PadToBlocks can re-emit the header.
 	opts BuildOpts
+}
+
+// MinNodeSize is the smallest node a B-tree may use. TN1150 puts the
+// floor at 512, and the header node has to hold its three records
+// (BTHeaderRec, 128 bytes of user data, and the allocation map) plus the
+// offset table, so anything smaller has no room for a map at all.
+const MinNodeSize = 512
+
+// mapBitsInHeaderNode is how many "node is in use" bits fit in the
+// header node's map record: everything left after the descriptor, the
+// four-entry offset table, the BTHeaderRec, and the 128-byte user-data
+// record.
+//
+// This and [mapBitsInMapNode] are the single source of truth for the
+// map's geometry, so the node-count loop, the two emitters, and
+// [BuildResult.PadToBlocks] cannot drift apart and leave a used node
+// marked free. Refer to the project's Wiki for in-depth information.
+func mapBitsInHeaderNode(nodeSize int) int {
+	return (nodeSize - BTNodeDescriptorSize - 4*2 - BTHeaderRecSize - 128) * 8
+}
+
+// mapBitsInMapNode is how many bits fit in one chained map node: the
+// whole body minus the descriptor, the record's offset slot and the
+// free-space slot.
+func mapBitsInMapNode(nodeSize int) int {
+	return (nodeSize - BTNodeDescriptorSize - 2*2) * 8
 }
 
 // PadToBlocks grows the tree image to exactly `blocks*blockSize` bytes,
@@ -75,6 +107,13 @@ func (r *BuildResult) PadToBlocks(blocks, blockSize uint32) error {
 			wantBytes, r.opts.NodeSize)
 	}
 	newTotal := uint32(wantBytes / uint64(r.opts.NodeSize))
+	// The nodes added here are free, so their map bits stay clear, but
+	// the map still has to have a bit for each of them: past that, the
+	// header claims nodes the map has never heard of.
+	if newTotal > r.mapCoverage {
+		return fmt.Errorf("hfsplus: PadToBlocks: %d nodes exceeds the %d the allocation map can describe",
+			newTotal, r.mapCoverage)
+	}
 	if uint64(len(r.Bytes)) < wantBytes {
 		grown := make([]byte, wantBytes)
 		copy(grown, r.Bytes)
@@ -108,6 +147,10 @@ func BuildTree(records []Record, opts BuildOpts) (*BuildResult, error) {
 	}
 	if opts.NodeSize&(opts.NodeSize-1) != 0 {
 		return nil, fmt.Errorf("hfsplus: BuildTree: NodeSize %d is not a power of two", opts.NodeSize)
+	}
+	if opts.NodeSize < MinNodeSize {
+		return nil, fmt.Errorf("hfsplus: BuildTree: NodeSize %d is below the %d-byte minimum",
+			opts.NodeSize, MinNodeSize)
 	}
 	nodeSize := int(opts.NodeSize)
 	clumpSize := opts.ClumpSize
@@ -152,22 +195,34 @@ func BuildTree(records []Record, opts BuildOpts) (*BuildResult, error) {
 		// The first index key in a node always uses the same key value
 		// as the first record of its child leaf/node. Index records are
 		// (key, child node number). We don't know the child node numbers
-		// yet — we'll fill them in later — but we know how big they are.
+		// yet - we'll fill them in later - but we know how big they are.
 		var idx [][]idxRec
 		var cur []idxRec
-		used := 14 + 2
+		var widestKey int
+		used := BTNodeDescriptorSize + 2
 		for i, k := range prev.firstKey {
 			recSize := 2 + len(k) + 4 + 2
+			if len(k) > widestKey {
+				widestKey = len(k)
+			}
 			if used+recSize > nodeSize && len(cur) > 0 {
 				idx = append(idx, cur)
 				cur = nil
-				used = 14 + 2
+				used = BTNodeDescriptorSize + 2
 			}
 			cur = append(cur, idxRec{key: k, childIdx: uint32(i)})
 			used += recSize
 		}
 		if len(cur) > 0 {
 			idx = append(idx, cur)
+		}
+		// Keys wide enough that only one index record fits per node give
+		// a level no smaller than the one below it, so the tree never
+		// reaches a single root and this loop runs forever. packLeaves
+		// guards the same shape for leaves; this is the index half.
+		if len(idx) >= len(prev.firstKey) {
+			return nil, fmt.Errorf("hfsplus: BuildTree: NodeSize %d holds too few index records for keys up to %d bytes; the index level cannot shrink",
+				nodeSize, widestKey)
 		}
 		var fk [][]byte
 		for _, n := range idx {
@@ -185,28 +240,19 @@ func BuildTree(records []Record, opts BuildOpts) (*BuildResult, error) {
 			totalNodes += uint32(len(lvl.indices))
 		}
 	}
-	mapBitsInHeader := (nodeSize - 14 - 2 /* offset slot */ - 2 /* free-space slot */ -
-		3*2 /* three more offset slots for the header's 3 records */ -
-		106 /* BTHeaderRec */ - 128 /* userData */) * 8
-	// We always pad the map record to fill the node, so it can hold up to
-	// `mapBitsInHeader` node bits. If our tree exceeds that, allocate
-	// chained BTMapNode nodes.
+	// We always pad the map record to fill the header node, so it holds
+	// up to `headerBits` node bits. A tree that exceeds that allocates
+	// chained BTMapNode nodes for the rest. Each map node counts itself,
+	// so the condition is re-evaluated against the running total rather
+	// than a precomputed shortfall.
+	headerBits := mapBitsInHeaderNode(nodeSize)
+	perMapNode := mapBitsInMapNode(nodeSize)
 	var mapNodes uint32
-	if int(totalNodes) > mapBitsInHeader {
-		// Each map node has a single map record filling the node body
-		// minus 14 (descriptor) + 2 (offset slot) + 2 (free-space slot).
-		bitsPerMapNode := (nodeSize - 14 - 4) * 8
-		need := int(totalNodes) - mapBitsInHeader
-		for need > 0 {
-			mapNodes++
-			need -= bitsPerMapNode
-			totalNodes++ // each map node adds itself to the count
-		}
-		// One more pass may be needed because adding map nodes increases
-		// totalNodes which may need yet another map node. The loop above
-		// already accounts for that because we recompute `need` each
-		// iteration based on the running totalNodes.
+	for int64(totalNodes) > int64(headerBits)+int64(mapNodes)*int64(perMapNode) {
+		mapNodes++
+		totalNodes++ // the map node adds itself to the count it describes
 	}
+	mapCoverage := int64(headerBits) + int64(mapNodes)*int64(perMapNode)
 
 	// 4. Assign node numbers.
 	//    Order: 0=header, 1..mapNodes=map chain, then leaves bottom-up,
@@ -252,14 +298,18 @@ func BuildTree(records []Record, opts BuildOpts) (*BuildResult, error) {
 	}
 	emitHeaderNode(out[0:nodeSize], nodeSize, header, totalNodes, mapNodes)
 
-	// Map nodes (if any).
+	// Map nodes (if any). Map node i continues the bitmap where the
+	// header's record stopped, so it owns node numbers
+	// [headerBits + i*perMapNode, +perMapNode).
 	for i := uint32(0); i < mapNodes; i++ {
 		mapNodeNum := 1 + i
 		next := uint32(0)
 		if i+1 < mapNodes {
 			next = mapNodeNum + 1
 		}
-		emitMapNode(out[int(mapNodeNum)*nodeSize:int(mapNodeNum+1)*nodeSize], nodeSize, next)
+		firstBit := uint32(int64(headerBits) + int64(i)*int64(perMapNode))
+		emitMapNode(out[int(mapNodeNum)*nodeSize:int(mapNodeNum+1)*nodeSize], nodeSize, next,
+			firstBit, totalNodes)
 	}
 
 	// Leaves.
@@ -319,6 +369,7 @@ func BuildTree(records []Record, opts BuildOpts) (*BuildResult, error) {
 		LastLeaf:    header.LastLeafNode,
 		LeafRecords: header.LeafRecords,
 		FreeNodes:   0,
+		mapCoverage: uint32(mapCoverage),
 		opts:        opts,
 	}, nil
 }
@@ -377,7 +428,7 @@ func writeRecordsNode(node []byte, nodeSize int, desc BTNodeDescriptor, recs []w
 	//
 	// i.e. offset[i] lives at node[nodeSize - 2*(i+1) : nodeSize - 2*i].
 	// In memory order (low → high addr) the array reads as
-	// [free-space, offset[N-1], ..., offset[1], offset[0]] — a strictly
+	// [free-space, offset[N-1], ..., offset[1], offset[0]] - a strictly
 	// *decreasing* sequence of uint16 values. This is what
 	// hfs_swap_BTNode / fsck_hfs expect.
 	n := len(recs)
@@ -411,19 +462,17 @@ func emitHeaderNode(node []byte, nodeSize int, hdr BTHeaderRec, totalNodes, mapN
 	off2 := off1 + 128
 	offTableSize := uint16(4 * 2) // 3 offsets + free-space
 	mapEnd := uint16(nodeSize) - offTableSize
-	mapBytes := mapEnd - off2
-	// Each bit in the map = "node is in use". We mark the header,
-	// any map nodes, and every node we allocated.
-	totalUsed := totalNodes
-	for n := uint32(0); n < totalUsed; n++ {
-		bitOff := n
-		byteOff := off2 + uint16(bitOff/8)
+	// Each bit in the map = "node is in use". We mark the header, any
+	// map nodes, and every node we allocated; bits past this record's
+	// capacity ([mapBitsInHeaderNode]) belong to the chained map nodes
+	// that [emitMapNode] fills.
+	for n := uint32(0); n < totalNodes; n++ {
+		byteOff := off2 + uint16(n/8)
 		if byteOff >= mapEnd {
 			break // remaining bits are in chained map nodes
 		}
-		node[byteOff] |= 1 << (7 - (bitOff % 8))
+		node[byteOff] |= 1 << (7 - (n % 8))
 	}
-	_ = mapBytes
 
 	// Offset table layout (see the comment in writeRecordsNode for the
 	// authoritative description). For a 3-record header node the four
@@ -438,7 +487,15 @@ func emitHeaderNode(node []byte, nodeSize int, hdr BTHeaderRec, totalNodes, mapN
 	binary.BigEndian.PutUint16(node[nodeSize-8:nodeSize-6], mapEnd) // free-space
 }
 
-func emitMapNode(node []byte, nodeSize int, nextMapNode uint32) {
+// emitMapNode writes one node of the chained allocation map. The record
+// continues the bitmap that the header node's map record started:
+// firstBit is the node number its first bit stands for, and every node
+// below totalNodes that falls in this node's span is marked in use.
+//
+// Writing the bits is not optional. fsck_hfs reads a used node marked
+// free as damage, so a structurally valid map node full of zeros
+// condemns every node it covers.
+func emitMapNode(node []byte, nodeSize int, nextMapNode, firstBit, totalNodes uint32) {
 	desc := BTNodeDescriptor{
 		FLink:      nextMapNode,
 		Kind:       BTMapNode,
@@ -451,9 +508,15 @@ func emitMapNode(node []byte, nodeSize int, nextMapNode uint32) {
 	// offset[0] at the highest address, free-space at the lower slot.
 	binary.BigEndian.PutUint16(node[nodeSize-2:nodeSize], off0)
 	binary.BigEndian.PutUint16(node[nodeSize-4:nodeSize-2], mapEnd) // free-space
-	// Map bits are written by the caller of BuildTree via a follow-up
-	// helper if the tree is large enough to need them; for our MVP the
-	// header always has enough room and this branch is not used.
+
+	// Bit ordering matches the header's record: MSB first within a byte.
+	for n := firstBit; n < totalNodes; n++ {
+		byteOff := off0 + uint16((n-firstBit)/8)
+		if byteOff >= mapEnd {
+			break // the rest belongs to the next map node in the chain
+		}
+		node[byteOff] |= 1 << (7 - ((n - firstBit) % 8))
+	}
 }
 
 // emitEmptyTree returns a minimal valid B-tree image consisting of just
@@ -480,13 +543,14 @@ func emitEmptyTree(opts BuildOpts, clumpSize uint32) (*BuildResult, error) {
 	}
 	emitHeaderNode(out, nodeSize, hdr, 1, 0)
 	return &BuildResult{
-		Bytes:      out,
-		TotalNodes: 1,
-		TreeDepth:  0,
-		RootNode:   0,
-		FirstLeaf:  0,
-		LastLeaf:   0,
-		opts:       opts,
+		Bytes:       out,
+		TotalNodes:  1,
+		TreeDepth:   0,
+		RootNode:    0,
+		FirstLeaf:   0,
+		LastLeaf:    0,
+		mapCoverage: uint32(mapBitsInHeaderNode(nodeSize)),
+		opts:        opts,
 	}, nil
 }
 

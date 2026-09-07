@@ -57,6 +57,65 @@ func mkRoot(macTime uint32) *Entry {
 	return e
 }
 
+// TestWriteVolumeDetectsFileSizeChange: the extent for a file is sized
+// from the length the caller reported, so the opener has to hand over
+// exactly that many bytes. A file that grew between the walk and the
+// write used to be truncated into the image silently, because io.CopyN
+// stops at the requested count and reports no error.
+func TestWriteVolumeDetectsFileSizeChange(t *testing.T) {
+	macTime := MacTime(macEpoch.Add(60 * 60 * 24 * 365 * 100))
+
+	tests := []struct {
+		name     string
+		reported uint64 // what the walk saw
+		actual   string // what the opener delivers
+		want     string // substring of the expected error
+	}{
+		{"grew", 8, "the file got longer", "grew"},
+		{"shrank", 64, "short", "shrank"},
+		{"unchanged", 8, "12345678", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			root := mkRoot(macTime)
+			root.Valence = 1
+			name, _ := NewName("f.txt")
+			file := &Entry{
+				CNID: 16, ParentCNID: CNIDRootFolder, Name: name, Kind: KindFile,
+				Mode: 0o100644, OwnerID: 99, GroupID: 99,
+				CreateTime: macTime, ContentModTime: macTime, AttributeModTime: macTime,
+				AccessTime: macTime, BackupTime: macTime,
+				DataLogicalSize: tt.reported,
+			}
+			inputs := &VolumeInputs{
+				Entries: []*Entry{root, file},
+				UserFiles: []UserFileInput{{
+					Entry: file,
+					Size:  tt.reported,
+					Opener: func() (io.ReadCloser, error) {
+						return io.NopCloser(strings.NewReader(tt.actual)), nil
+					},
+				}},
+				BlockSize: 4096,
+				MacTime:   macTime,
+			}
+			_, err := WriteVolume(&memWriteSeeker{}, inputs)
+			if tt.want == "" {
+				if err != nil {
+					t.Fatalf("WriteVolume: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("WriteVolume accepted a file that %s under it", tt.name)
+			}
+			if !strings.Contains(err.Error(), tt.want) {
+				t.Errorf("error should say the file %s, got: %v", tt.want, err)
+			}
+		})
+	}
+}
+
 func TestWriteVolumeSmallImage(t *testing.T) {
 	macTime := MacTime(macEpoch.Add(60 * 60 * 24 * 365 * 100)) // ~2004
 

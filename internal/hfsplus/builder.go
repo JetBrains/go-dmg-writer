@@ -1,6 +1,7 @@
 package hfsplus
 
 import (
+	"errors"
 	"fmt"
 	"io"
 )
@@ -76,8 +77,8 @@ func WriteVolume(out io.WriteSeeker, in *VolumeInputs) (volumeSize uint64, err e
 		}
 	}
 
-	// 1. Pack the trees once with placeholder file extents — that is the
-	// first time we learn how big each tree's bytes are. The record
+	// 1. Pack all trees with placeholder file extents to
+	// get how big each tree's bytes are. The record
 	// sizes don't depend on the extent values, so the result of the
 	// second pack below is guaranteed identical in size.
 	catRes, err := BuildCatalogTree(in.Entries, CatalogNodeSize)
@@ -150,8 +151,16 @@ func WriteVolume(out io.WriteSeeker, in *VolumeInputs) (volumeSize uint64, err e
 		return 0, err
 	}
 
-	// 8. Write the allocation bitmap.
-	if err := writeAt(out, int64(plan.AllocStartBlock)*int64(plan.BlockSize), plan.AllocBitmap.Bytes()); err != nil {
+	// 8. Write the allocation bitmap. The size check is not decoration:
+	// the bitmap is written as one run at AllocStartBlock, so a bitmap
+	// larger than its own fork silently overwrites the catalog that
+	// follows it. Refusing to write beats shipping a corrupt image.
+	bitmap := plan.AllocBitmap.Bytes()
+	if forkBytes := uint64(plan.AllocFile.TotalBlocks) * uint64(plan.BlockSize); uint64(len(bitmap)) > forkBytes {
+		return 0, fmt.Errorf("hfsplus: allocation bitmap is %d bytes but its fork holds %d",
+			len(bitmap), forkBytes)
+	}
+	if err := writeAt(out, int64(plan.AllocStartBlock)*int64(plan.BlockSize), bitmap); err != nil {
 		return 0, err
 	}
 
@@ -209,12 +218,27 @@ func streamFileAt(out io.WriteSeeker, off int64, opener FileOpener, size uint64)
 	if _, err := out.Seek(off, io.SeekStart); err != nil {
 		return err
 	}
+	// The extent of this file was sized from the length the walk saw,
+	// so exactly `size` bytes have to be available now. A file that
+	// changed since then does not fit the volume that was planned around
+	// it, and either half of that has to be an error.
 	written, err := io.CopyN(out, rc, int64(size))
+	if errors.Is(err, io.EOF) || (err == nil && uint64(written) != size) {
+		return fmt.Errorf("file shrank while the image was being built: read %d of %d bytes", written, size)
+	}
 	if err != nil {
 		return err
 	}
-	if uint64(written) != size {
-		return fmt.Errorf("short file: wrote %d of %d bytes", written, size)
+	// io.CopyN stops at `size` and reports success no matter if the
+	// source has more, so a file that grew would be truncated into the
+	// image silently. One more read tells the two apart.
+	var probe [1]byte
+	switch _, err := io.ReadFull(rc, probe[:]); {
+	case errors.Is(err, io.EOF):
+		return nil
+	case err == nil:
+		return fmt.Errorf("file grew while the image was being built: longer than the planned %d bytes", size)
+	default:
+		return err
 	}
-	return nil
 }
