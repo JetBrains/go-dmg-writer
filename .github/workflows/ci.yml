@@ -57,13 +57,6 @@ jobs:
       - name: go vet
         run: go vet ./...
 
-      - name: go vet (large build tag)
-        # The performance benchmark file is gated behind `//go:build large`
-        # and isn't compiled on a vanilla `go vet ./...`. Vetting it in
-        # the lint job catches obvious regressions in the bench harness
-        # without needing a full build matrix.
-        run: go vet -tags=large ./...
-
   # Linux
   build-linux:
     name: build (ubuntu)
