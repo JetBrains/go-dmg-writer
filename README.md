@@ -1,5 +1,7 @@
 # go-dmg-writer
 
+![Internal](https://jb.gg/badges/internal-plastic.svg)
+
 A pure-Go, cross-platform writer for Apple's UDIF (`.dmg`) disk images
 containing an HFS+ filesystem.
 
